@@ -1,0 +1,26 @@
+# Archive payload — never versioned. These are tens of gigabytes of exported
+# market data whose integrity is guaranteed by MANIFEST checksums, not by git.
+/archive/
+/ticks/
+/logs/
+/pgdata/
+*.csv
+*.csv.zst
+*.csv.gz
+*.sha256
+*.PARTIAL-ABORTED-*
+
+# Manifests are data too: append-only ledgers written by the export scripts.
+# Versioning them would conflict on every run and prove nothing the sha256
+# inside them does not already prove.
+/MANIFEST.tsv
+/TRADES-MANIFEST.tsv
+/MANIFEST.tsv.bak-*
+
+# Lock files and stray run artefacts
+/.retention.lock
+/.trades-backfill.lock
+/p*-*.log
+/.candles.lock
+/.polygon.lock
+/.trades-archive.lock

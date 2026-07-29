@@ -1,0 +1,38 @@
+MAILTO=""
+
+# Installation-specific values. Replace every placeholder before installing
+# this crontab. SNAPPER_ARCHIVE_ROOT is explicit here for operational clarity;
+# the scripts can otherwise derive it from their location. Crontab assignments
+# are exported to each job automatically; shell-style `export` is not valid here.
+SNAPPER_ENV_FILE="/absolute/path/to/private/database.env"
+SNAPPER_ARCHIVE_ROOT="/absolute/path/to/snapper-archive"
+SNAPPER_APP_ROOT="/absolute/path/to/snapper"
+SNAPPER_DB_HOST_FROM="host-as-written-in-DB_URL"
+SNAPPER_DB_HOST_TO="host-reachable-from-cron-host"
+SNAPPER_GITLINK_REMOTES="origin secondary-mirror"
+
+# Snapper data retention. Logs: ${SNAPPER_ARCHIVE_ROOT}/logs/
+#
+# TIMEZONE: Ubuntu cron 3.0pl1 does NOT honour CRON_TZ (a cronie/Red Hat
+# extension absent from this build -- see /usr/share/doc/cron/FEATURES:
+# "TZ can be set, but cron ignores it ... passing it on through to the
+# commands it runs"). Schedule times below are therefore ALWAYS system
+# local time (Europe/Warsaw). This is intentional and safe:
+#   - the retention WINDOW is computed with `date -u` inside the scripts,
+#     so eligibility is DST-independent regardless of when cron fires;
+#   - 03:17 / 04:30 local sit OUTSIDE the 02:00-03:00 DST switch window,
+#     so no fire is ever doubled or skipped across a clock change;
+#   - flock + manifest idempotency + 3-day catch-up backstop any miss.
+# If a guaranteed-UTC fire time is ever required, convert to a systemd
+# timer with `OnCalendar=*-*-* 03:17:00 UTC` (cron cannot express it).
+#
+# Daily 05:00 local: Polygon ingest in two phases — fetch (rate limited to
+# ~12s/symbol, 2-3h for ~593 symbols, API+disk only) then load (writes candles).
+# 05:00 because the daily flat files only exist after midnight UTC, and because
+# it puts the DB-writing phase around 07:00-08:00, clear of the 03:17 retention
+# job — the two would otherwise contend on the candles table.
+0 5 * * * "${SNAPPER_ARCHIVE_ROOT}/bin/polygon-daily.sh"
+# Daily 03:17 local: export+purge every tick day that fell out of the configured horizon.
+17 3 * * * "${SNAPPER_ARCHIVE_ROOT}/bin/retention-daily.sh"
+# Weekly Sun 04:30 local: sweep closed SCD2 candle versions across the full history.
+30 4 * * 0 "${SNAPPER_ARCHIVE_ROOT}/bin/retention-weekly-candles.sh"
