@@ -2,10 +2,10 @@
 # Purge one verified UTC ticks day by bus timestamp.
 #
 # Refuses before connecting unless the ticks manifest line and archive exist
-# and the compressed file's sha256 and byte size match. An exact daily partition
-# is counted, detached, and dropped atomically; a day in a wider legacy partition
-# keeps the transactional DELETE and row-count assertion path. The retention
-# caller provides flock serialisation.
+# and the compressed file's sha256 and byte size match. The exact daily
+# partition is revalidated after locking, counted, detached, and dropped in one
+# transaction; missing or default-routed days are never purge targets. The
+# retention caller provides flock serialisation.
 set -euo pipefail
 # A caller's `bash -x` must never trace DB_URL or PGPASSWORD assignments.
 set +x
@@ -201,33 +201,27 @@ PSQL=(
 )
 
 RELATION="\"$SCHEMA\".\"ticks\""
-PREDICATE="id >= $ID_LOWER AND id < $ID_UPPER
-  AND \"timestamp\" >= '$LOWER'::timestamptz AND \"timestamp\" < '$UPPER'::timestamptz"
 
-# Resolve the storage for this day from PostgreSQL's partition catalog. An exact
-# daily range is the only shape eligible for DETACH + DROP. A wider explicit
-# range (the legacy partition in production) stays on DELETE. If no explicit
-# range covers the complete day, the DEFAULT partition would receive it and is
-# a routing failure, not a purge target.
+# Resolve the day's storage from PostgreSQL's partition catalog. Only one
+# ordinary leaf with the exact UTC daily bound is eligible. A missing leaf may
+# mean the day was already purged, is not yet created, or lies outside the
+# attached range; DEFAULT remains a routing failure, never a purge target.
 PARENT_STATE=$("${PSQL[@]}" -F $'\t' \
   -c "SET statement_timeout='$CATALOG_STATEMENT_TIMEOUT'" \
   -c "
 SELECT parent.relkind,
-       CASE
-         WHEN parent.relkind <> 'p' THEN true
-         ELSE EXISTS (
-           SELECT 1
-           FROM pg_catalog.pg_partitioned_table partitioned
-           JOIN pg_catalog.pg_attribute key_column
-             ON key_column.attrelid = partitioned.partrelid
-            AND key_column.attnum = partitioned.partattrs[0]
-           WHERE partitioned.partrelid = parent.oid
-             AND partitioned.partstrat = 'r'
-             AND partitioned.partnatts = 1
-             AND partitioned.partexprs IS NULL
-             AND key_column.attname = 'timestamp'
-         )
-       END
+       EXISTS (
+         SELECT 1
+         FROM pg_catalog.pg_partitioned_table partitioned
+         JOIN pg_catalog.pg_attribute key_column
+           ON key_column.attrelid = partitioned.partrelid
+          AND key_column.attnum = partitioned.partattrs[0]
+         WHERE partitioned.partrelid = parent.oid
+           AND partitioned.partstrat = 'r'
+           AND partitioned.partnatts = 1
+           AND partitioned.partexprs IS NULL
+           AND key_column.attname = 'timestamp'
+       )
 FROM pg_catalog.pg_class parent
 JOIN pg_catalog.pg_namespace parent_namespace
   ON parent_namespace.oid = parent.relnamespace
@@ -244,18 +238,25 @@ WHERE parent_namespace.nspname = '$SCHEMA'
 IFS=$'\t' read -r PARENT_RELKIND PARTITION_KEY_OK <<<"$PARENT_STATE"
 case "$PARENT_RELKIND" in
   r)
-    PURGE_MODE=DELETE
+    echo "REFUSE $DAY: $SCHEMA.ticks has no daily partitions" >&2
+    exit 1
     ;;
   p)
     [[ "$PARTITION_KEY_OK" == "t" ]] || {
       echo "ABORT $DAY: $SCHEMA.ticks is not range-partitioned on timestamp" >&2
       exit 1
     }
+    ;;
+  *)
+    echo "ABORT $DAY: unsupported $SCHEMA.ticks relation kind" >&2
+    exit 1
+    ;;
+esac
 
-    PARTITION_DECISION=$("${PSQL[@]}" -F $'\t' \
-      -c "SET statement_timeout='$CATALOG_STATEMENT_TIMEOUT'" \
-      -c "SET TIME ZONE 'UTC'" \
-      -c "
+PARTITION_DECISION=$("${PSQL[@]}" -F $'\t' \
+  -c "SET statement_timeout='$CATALOG_STATEMENT_TIMEOUT'" \
+  -c "SET TIME ZONE 'UTC'" \
+  -c "
 WITH children AS (
   SELECT child.oid,
          child_namespace.nspname,
@@ -281,26 +282,6 @@ WITH children AS (
     '$LOWER'::timestamptz,
     '$UPPER'::timestamptz
   )
-), parsed_ranges AS (
-  SELECT children.*,
-         CASE
-           WHEN parts[1] = 'MINVALUE' THEN '-infinity'::timestamptz
-           ELSE parts[2]::timestamptz
-         END AS lower_bound,
-         CASE
-           WHEN parts[3] = 'MAXVALUE' THEN 'infinity'::timestamptz
-           ELSE parts[4]::timestamptz
-         END AS upper_bound
-  FROM children
-  CROSS JOIN LATERAL pg_catalog.regexp_match(
-    children.bound,
-    '^FOR VALUES FROM \((MINVALUE|''([^'']+)'')\) TO \((MAXVALUE|''([^'']+)'')\)$'
-  ) AS matched(parts)
-), covering_partition AS (
-  SELECT *
-  FROM parsed_ranges
-  WHERE lower_bound <= '$LOWER'::timestamptz
-    AND upper_bound >= '$UPPER'::timestamptz
 ), default_partition AS (
   SELECT *
   FROM children
@@ -318,51 +299,52 @@ WITH children AS (
 
   UNION ALL
 
-  SELECT 3, 'DELETE', ''::name, ''::name
-  WHERE NOT EXISTS (SELECT 1 FROM exact_partition)
-    AND EXISTS (SELECT 1 FROM covering_partition)
-
-  UNION ALL
-
-  SELECT 4, 'DEFAULT', nspname, relname
+  SELECT 3, 'DEFAULT', nspname, relname
   FROM default_partition
   WHERE NOT EXISTS (SELECT 1 FROM exact_partition)
-    AND NOT EXISTS (SELECT 1 FROM covering_partition)
 
   UNION ALL
 
-  SELECT 5, 'DELETE', ''::name, ''::name
+  SELECT 4, 'MISSING', ''::name, ''::name
   WHERE NOT EXISTS (SELECT 1 FROM exact_partition)
-    AND NOT EXISTS (SELECT 1 FROM covering_partition)
     AND NOT EXISTS (SELECT 1 FROM default_partition)
 )
 SELECT mode, nspname, relname
 FROM decisions
 ORDER BY priority
 LIMIT 1;") || {
-      echo "ABORT $DAY: could not resolve ticks partition for target day" >&2
-      exit 1
-    }
+  echo "ABORT $DAY: could not resolve ticks partition for target day" >&2
+  exit 1
+}
 
-    [[ -n "$PARTITION_DECISION" && "$PARTITION_DECISION" != *$'\n'* ]] || {
-      echo "ABORT $DAY: ambiguous ticks partition catalog result" >&2
-      exit 1
-    }
-    IFS=$'\t' read -r PURGE_MODE TARGET_PARTITION_SCHEMA TARGET_PARTITION_NAME \
-      <<<"$PARTITION_DECISION"
+[[ -n "$PARTITION_DECISION" && "$PARTITION_DECISION" != *$'\n'* ]] || {
+  echo "ABORT $DAY: ambiguous ticks partition catalog result" >&2
+  exit 1
+}
+IFS=$'\t' read -r PARTITION_STATE TARGET_PARTITION_SCHEMA TARGET_PARTITION_NAME \
+  <<<"$PARTITION_DECISION"
+
+case "$PARTITION_STATE" in
+  PARTITION)
+    ;;
+  DEFAULT)
+    echo "REFUSE $DAY: no exact ticks partition (already purged, not yet created, or outside the partitioned range); default partition $TARGET_PARTITION_SCHEMA.$TARGET_PARTITION_NAME is not a purge target" >&2
+    exit 1
+    ;;
+  MISSING)
+    echo "REFUSE $DAY: no exact ticks partition (already purged, not yet created, or outside the partitioned range)" >&2
+    exit 1
     ;;
   *)
-    echo "ABORT $DAY: unsupported $SCHEMA.ticks relation kind" >&2
+    echo "REFUSE $DAY: target day does not have one safe purge mapping" >&2
     exit 1
     ;;
 esac
 
-case "$PURGE_MODE" in
-  PARTITION)
-    if ! "${PSQL[@]}" \
-      -c "SET statement_timeout='$PURGE_STATEMENT_TIMEOUT'" \
-      -c "SET TIME ZONE 'UTC'" \
-      -c "
+if ! "${PSQL[@]}" \
+  -c "SET statement_timeout='$PURGE_STATEMENT_TIMEOUT'" \
+  -c "SET TIME ZONE 'UTC'" \
+  -c "
 DO \$\$
 DECLARE
   parent_oid oid;
@@ -460,103 +442,7 @@ BEGIN
   RAISE NOTICE 'purged $DAY via partition: % rows', n;
 END
 \$\$;"; then
-      echo "REFUSE $DAY: partition purge transaction did not commit" >&2
-      exit 1
-    fi
-
-    echo "PURGED $DAY rows=$ROWS"
-    exit 0
-    ;;
-  DEFAULT)
-    echo "REFUSE $DAY: target day resolves to default partition $TARGET_PARTITION_SCHEMA.$TARGET_PARTITION_NAME" >&2
-    exit 1
-    ;;
-  DELETE)
-    ;;
-  *)
-    echo "REFUSE $DAY: target day does not have one safe purge mapping" >&2
-    exit 1
-    ;;
-esac
-
-if ! "${PSQL[@]}" \
-  -c "SET statement_timeout='$PURGE_STATEMENT_TIMEOUT'" \
-  -c "SET TIME ZONE 'UTC'" \
-  -c "SET maintenance_work_mem='1GB'" \
-  -c "
-DO \$\$
-DECLARE
-  parent_oid oid;
-  parent_relkind "char";
-  n bigint;
-BEGIN
-  LOCK TABLE ONLY $RELATION IN SHARE UPDATE EXCLUSIVE MODE;
-
-  SELECT parent.oid, parent.relkind
-    INTO STRICT parent_oid, parent_relkind
-  FROM pg_catalog.pg_class parent
-  JOIN pg_catalog.pg_namespace parent_namespace
-    ON parent_namespace.oid = parent.relnamespace
-  WHERE parent_namespace.nspname = '$SCHEMA'
-    AND parent.relname = 'ticks';
-
-  IF parent_relkind = 'p' THEN
-    IF NOT EXISTS (
-      SELECT 1
-      FROM pg_catalog.pg_partitioned_table partitioned
-      JOIN pg_catalog.pg_attribute key_column
-        ON key_column.attrelid = partitioned.partrelid
-       AND key_column.attnum = partitioned.partattrs[0]
-      WHERE partitioned.partrelid = parent_oid
-        AND partitioned.partstrat = 'r'
-        AND partitioned.partnatts = 1
-        AND partitioned.partexprs IS NULL
-        AND key_column.attname = 'timestamp'
-    ) THEN
-      RAISE EXCEPTION 'ticks partition key changed before DELETE';
-    END IF;
-
-    IF NOT EXISTS (
-      SELECT 1
-      FROM pg_catalog.pg_inherits inheritance
-      JOIN pg_catalog.pg_class child
-        ON child.oid = inheritance.inhrelid
-      CROSS JOIN LATERAL pg_catalog.regexp_match(
-        pg_catalog.pg_get_expr(child.relpartbound, child.oid),
-        '^FOR VALUES FROM \((MINVALUE|''([^'']+)'')\) TO \((MAXVALUE|''([^'']+)'')\)$'
-      ) AS matched(parts)
-      WHERE inheritance.inhparent = parent_oid
-        AND child.relispartition
-        AND child.relkind = 'r'
-        AND pg_catalog.pg_get_expr(child.relpartbound, child.oid) <> format(
-          'FOR VALUES FROM (%L) TO (%L)',
-          '$LOWER'::timestamptz,
-          '$UPPER'::timestamptz
-        )
-        AND CASE
-              WHEN parts[1] = 'MINVALUE' THEN '-infinity'::timestamptz
-              ELSE parts[2]::timestamptz
-            END <= '$LOWER'::timestamptz
-        AND CASE
-              WHEN parts[3] = 'MAXVALUE' THEN 'infinity'::timestamptz
-              ELSE parts[4]::timestamptz
-            END >= '$UPPER'::timestamptz
-    ) THEN
-      RAISE EXCEPTION 'ticks DELETE route for $DAY changed or resolves to default';
-    END IF;
-  ELSIF parent_relkind <> 'r' THEN
-    RAISE EXCEPTION 'unsupported ticks relation kind before DELETE';
-  END IF;
-
-  DELETE FROM $RELATION WHERE $PREDICATE;
-  GET DIAGNOSTICS n = ROW_COUNT;
-  IF n <> $ROWS THEN
-    RAISE EXCEPTION 'purge mismatch for $DAY: deleted % vs manifest $ROWS', n;
-  END IF;
-  RAISE NOTICE 'purged $DAY: % rows', n;
-END
-\$\$;"; then
-  echo "REFUSE $DAY: purge transaction did not pass its row-count assertion" >&2
+  echo "REFUSE $DAY: partition purge transaction did not commit" >&2
   exit 1
 fi
 

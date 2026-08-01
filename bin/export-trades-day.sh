@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# Export one UTC trade day by exchange event time, guarded by the catalog's
-# partitioned executed_at index family before COPY is allowed on production.
+# Export one UTC trade day by exchange event time from its exact attached daily
+# partition. That catalog preflight refuses an already-dropped day before it can
+# become a complete-looking empty archive; the executed_at index-family plan
+# guard still protects production before COPY is allowed.
 #
 # Archive format v1. The order is immutable because the restorer consumes the
 # first three fields positionally as public_id, timestamp, and known_to.
@@ -145,6 +147,52 @@ FROM $RELATION
 WHERE executed_at >= '$LOWER'::timestamptz
   AND executed_at < '$UPPER'::timestamptz
 ORDER BY executed_at, id"
+
+# DEFAULT can legitimately plan and COPY zero rows after an old daily leaf has
+# been dropped. Require the day's own ordinary leaf from the catalog so a
+# successful export still means the whole day was present, even when it is empty.
+EXACT_PARTITION=$("${PSQL[@]}" \
+  -c "SET statement_timeout='$EXPLAIN_STATEMENT_TIMEOUT'" \
+  -c "SET TIME ZONE 'UTC'" \
+  -c "
+SELECT child.oid
+FROM pg_catalog.pg_class parent
+JOIN pg_catalog.pg_namespace parent_namespace
+  ON parent_namespace.oid = parent.relnamespace
+JOIN pg_catalog.pg_partitioned_table partitioned
+  ON partitioned.partrelid = parent.oid
+JOIN pg_catalog.pg_attribute key_column
+  ON key_column.attrelid = partitioned.partrelid
+ AND key_column.attnum = partitioned.partattrs[0]
+JOIN pg_catalog.pg_inherits inheritance
+  ON inheritance.inhparent = parent.oid
+JOIN pg_catalog.pg_class child
+  ON child.oid = inheritance.inhrelid
+WHERE parent_namespace.nspname = '$SCHEMA'
+  AND parent.relname = 'trades'
+  AND partitioned.partstrat = 'r'
+  AND partitioned.partnatts = 1
+  AND partitioned.partexprs IS NULL
+  AND key_column.attname = 'executed_at'
+  AND child.relispartition
+  AND child.relkind = 'r'
+  AND pg_catalog.pg_get_expr(child.relpartbound, child.oid) = format(
+    'FOR VALUES FROM (%L) TO (%L)',
+    '$LOWER'::timestamptz,
+    '$UPPER'::timestamptz
+  );") || {
+  echo "ABORT $DAY: could not resolve the exact trades partition" >&2
+  exit 1
+}
+
+[[ -n "$EXACT_PARTITION" ]] || {
+  echo "REFUSE $DAY: no exact daily trades partition; export could be empty or incomplete" >&2
+  exit 1
+}
+[[ "$EXACT_PARTITION" =~ ^[0-9]+$ ]] || {
+  echo "ABORT $DAY: ambiguous exact trades partition catalog result" >&2
+  exit 1
+}
 
 # This is deliberately plain EXPLAIN, never EXPLAIN ANALYZE. On production,
 # refuse to run COPY unless the exact export query plans through an index in the

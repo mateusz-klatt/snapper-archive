@@ -14,11 +14,10 @@ append-only ledgers would conflict on every run.
 ## Why this exists as a repository at all
 
 These scripts delete production data. `purge-ticks-day.sh` and
-`purge-trades-day.sh` either detach and drop an exact daily partition or issue a
-transactional `DELETE` for a day still inside a wider legacy partition. Both
-paths are gated on a manifest they verify first. Until 2026-07-29 the scripts
-lived on one disk with no history, so a bad edit had no way back and no way to
-review. That is the gap this closes.
+`purge-trades-day.sh` detach and drop only the exact daily partition for a day
+whose manifest and archive they verify first. Until 2026-07-29 the scripts lived
+on one disk with no history, so a bad edit had no way back and no way to review.
+That is the gap this closes.
 
 ## The safety contract every script here honours
 
