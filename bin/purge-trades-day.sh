@@ -2,8 +2,9 @@
 # Purge one verified UTC trade day by exchange event time.
 #
 # Refuses before connecting unless the trades manifest line and archive exist
-# and the compressed file's sha256 and byte size match. The DELETE and manifest
-# row-count assertion execute in one PostgreSQL statement transaction.
+# and the compressed file's sha256 and byte size match. An exact daily partition
+# is counted, detached, and dropped atomically; a day in a wider legacy partition
+# keeps the transactional DELETE and row-count assertion path.
 set -euo pipefail
 # A caller's `bash -x` must never trace DB_URL or PGPASSWORD assignments.
 set +x
@@ -203,6 +204,281 @@ PSQL=(
 RELATION="\"$SCHEMA\".\"trades\""
 PREDICATE="executed_at >= '$LOWER'::timestamptz AND executed_at < '$UPPER'::timestamptz"
 
+# Resolve the storage for this day from PostgreSQL's partition catalog. An exact
+# daily range is the only shape eligible for DETACH + DROP. A wider explicit
+# range (the legacy partition in production) stays on DELETE. If no explicit
+# range covers the complete day, the DEFAULT partition would receive it and is
+# a routing failure, not a purge target.
+PARENT_STATE=$("${PSQL[@]}" -F $'\t' \
+  -c "SET statement_timeout='$EXPLAIN_STATEMENT_TIMEOUT'" \
+  -c "
+SELECT parent.relkind,
+       CASE
+         WHEN parent.relkind <> 'p' THEN true
+         ELSE EXISTS (
+           SELECT 1
+           FROM pg_catalog.pg_partitioned_table partitioned
+           JOIN pg_catalog.pg_attribute key_column
+             ON key_column.attrelid = partitioned.partrelid
+            AND key_column.attnum = partitioned.partattrs[0]
+           WHERE partitioned.partrelid = parent.oid
+             AND partitioned.partstrat = 'r'
+             AND partitioned.partnatts = 1
+             AND partitioned.partexprs IS NULL
+             AND key_column.attname = 'executed_at'
+         )
+       END
+FROM pg_catalog.pg_class parent
+JOIN pg_catalog.pg_namespace parent_namespace
+  ON parent_namespace.oid = parent.relnamespace
+WHERE parent_namespace.nspname = '$SCHEMA'
+  AND parent.relname = 'trades';") || {
+  echo "ABORT $DAY: could not inspect trades partition catalog" >&2
+  exit 1
+}
+
+[[ -n "$PARENT_STATE" && "$PARENT_STATE" != *$'\n'* ]] || {
+  echo "ABORT $DAY: trades relation is missing or ambiguous" >&2
+  exit 1
+}
+IFS=$'\t' read -r PARENT_RELKIND PARTITION_KEY_OK <<<"$PARENT_STATE"
+case "$PARENT_RELKIND" in
+  r)
+    PURGE_MODE=DELETE
+    ;;
+  p)
+    [[ "$PARTITION_KEY_OK" == "t" ]] || {
+      echo "ABORT $DAY: $SCHEMA.trades is not range-partitioned on executed_at" >&2
+      exit 1
+    }
+
+    PARTITION_DECISION=$("${PSQL[@]}" -F $'\t' \
+      -c "SET statement_timeout='$EXPLAIN_STATEMENT_TIMEOUT'" \
+      -c "SET TIME ZONE 'UTC'" \
+      -c "
+WITH children AS (
+  SELECT child.oid,
+         child_namespace.nspname,
+         child.relname,
+         child.relkind,
+         pg_catalog.pg_get_expr(child.relpartbound, child.oid) AS bound
+  FROM pg_catalog.pg_class parent
+  JOIN pg_catalog.pg_namespace parent_namespace
+    ON parent_namespace.oid = parent.relnamespace
+  JOIN pg_catalog.pg_inherits inheritance
+    ON inheritance.inhparent = parent.oid
+  JOIN pg_catalog.pg_class child
+    ON child.oid = inheritance.inhrelid
+  JOIN pg_catalog.pg_namespace child_namespace
+    ON child_namespace.oid = child.relnamespace
+  WHERE parent_namespace.nspname = '$SCHEMA'
+    AND parent.relname = 'trades'
+), exact_partition AS (
+  SELECT *
+  FROM children
+  WHERE bound = format(
+    'FOR VALUES FROM (%L) TO (%L)',
+    '$LOWER'::timestamptz,
+    '$UPPER'::timestamptz
+  )
+), parsed_ranges AS (
+  SELECT children.*,
+         CASE
+           WHEN parts[1] = 'MINVALUE' THEN '-infinity'::timestamptz
+           ELSE parts[2]::timestamptz
+         END AS lower_bound,
+         CASE
+           WHEN parts[3] = 'MAXVALUE' THEN 'infinity'::timestamptz
+           ELSE parts[4]::timestamptz
+         END AS upper_bound
+  FROM children
+  CROSS JOIN LATERAL pg_catalog.regexp_match(
+    children.bound,
+    '^FOR VALUES FROM \((MINVALUE|''([^'']+)'')\) TO \((MAXVALUE|''([^'']+)'')\)$'
+  ) AS matched(parts)
+), covering_partition AS (
+  SELECT *
+  FROM parsed_ranges
+  WHERE lower_bound <= '$LOWER'::timestamptz
+    AND upper_bound >= '$UPPER'::timestamptz
+), default_partition AS (
+  SELECT *
+  FROM children
+  WHERE bound = 'DEFAULT'
+), decisions AS (
+  SELECT 1 AS priority, 'REFUSE'::text AS mode, ''::name AS nspname, ''::name AS relname
+  WHERE (SELECT count(*) FROM exact_partition) > 1
+     OR EXISTS (SELECT 1 FROM exact_partition WHERE relkind <> 'r')
+
+  UNION ALL
+
+  SELECT 2, 'PARTITION', nspname, relname
+  FROM exact_partition
+  WHERE relkind = 'r'
+
+  UNION ALL
+
+  SELECT 3, 'DELETE', ''::name, ''::name
+  WHERE NOT EXISTS (SELECT 1 FROM exact_partition)
+    AND EXISTS (SELECT 1 FROM covering_partition)
+
+  UNION ALL
+
+  SELECT 4, 'DEFAULT', nspname, relname
+  FROM default_partition
+  WHERE NOT EXISTS (SELECT 1 FROM exact_partition)
+    AND NOT EXISTS (SELECT 1 FROM covering_partition)
+
+  UNION ALL
+
+  SELECT 5, 'DELETE', ''::name, ''::name
+  WHERE NOT EXISTS (SELECT 1 FROM exact_partition)
+    AND NOT EXISTS (SELECT 1 FROM covering_partition)
+    AND NOT EXISTS (SELECT 1 FROM default_partition)
+)
+SELECT mode, nspname, relname
+FROM decisions
+ORDER BY priority
+LIMIT 1;") || {
+      echo "ABORT $DAY: could not resolve trades partition for target day" >&2
+      exit 1
+    }
+
+    [[ -n "$PARTITION_DECISION" && "$PARTITION_DECISION" != *$'\n'* ]] || {
+      echo "ABORT $DAY: ambiguous trades partition catalog result" >&2
+      exit 1
+    }
+    IFS=$'\t' read -r PURGE_MODE TARGET_PARTITION_SCHEMA TARGET_PARTITION_NAME \
+      <<<"$PARTITION_DECISION"
+    ;;
+  *)
+    echo "ABORT $DAY: unsupported $SCHEMA.trades relation kind" >&2
+    exit 1
+    ;;
+esac
+
+case "$PURGE_MODE" in
+  PARTITION)
+    if ! "${PSQL[@]}" \
+      -c "SET statement_timeout='$PURGE_STATEMENT_TIMEOUT'" \
+      -c "SET TIME ZONE 'UTC'" \
+      -c "
+DO \$\$
+DECLARE
+  parent_oid oid;
+  child_schema name;
+  child_name name;
+  partition_matches integer;
+  n bigint;
+BEGIN
+  SELECT parent.oid
+    INTO parent_oid
+  FROM pg_catalog.pg_class parent
+  JOIN pg_catalog.pg_namespace parent_namespace
+    ON parent_namespace.oid = parent.relnamespace
+  WHERE parent_namespace.nspname = '$SCHEMA'
+    AND parent.relname = 'trades';
+
+  IF parent_oid IS NULL THEN
+    RAISE EXCEPTION 'trades parent disappeared before purge';
+  END IF;
+
+  LOCK TABLE ONLY $RELATION IN ACCESS EXCLUSIVE MODE;
+
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_catalog.pg_partitioned_table partitioned
+    JOIN pg_catalog.pg_attribute key_column
+      ON key_column.attrelid = partitioned.partrelid
+     AND key_column.attnum = partitioned.partattrs[0]
+    WHERE partitioned.partrelid = parent_oid
+      AND partitioned.partstrat = 'r'
+      AND partitioned.partnatts = 1
+      AND partitioned.partexprs IS NULL
+      AND key_column.attname = 'executed_at'
+  ) THEN
+    RAISE EXCEPTION 'trades partition key changed before purge';
+  END IF;
+
+  SELECT count(*)
+    INTO partition_matches
+  FROM pg_catalog.pg_inherits inheritance
+  JOIN pg_catalog.pg_class child
+    ON child.oid = inheritance.inhrelid
+  WHERE inheritance.inhparent = parent_oid
+    AND child.relispartition
+    AND child.relkind = 'r'
+    AND pg_catalog.pg_get_expr(child.relpartbound, child.oid) = format(
+      'FOR VALUES FROM (%L) TO (%L)',
+      '$LOWER'::timestamptz,
+      '$UPPER'::timestamptz
+    );
+
+  IF partition_matches <> 1 THEN
+    RAISE EXCEPTION 'exact trades partition changed before purge: found %', partition_matches;
+  END IF;
+
+  SELECT child_namespace.nspname, child.relname
+    INTO STRICT child_schema, child_name
+  FROM pg_catalog.pg_inherits inheritance
+  JOIN pg_catalog.pg_class child
+    ON child.oid = inheritance.inhrelid
+  JOIN pg_catalog.pg_namespace child_namespace
+    ON child_namespace.oid = child.relnamespace
+  WHERE inheritance.inhparent = parent_oid
+    AND child.relispartition
+    AND child.relkind = 'r'
+    AND pg_catalog.pg_get_expr(child.relpartbound, child.oid) = format(
+      'FOR VALUES FROM (%L) TO (%L)',
+      '$LOWER'::timestamptz,
+      '$UPPER'::timestamptz
+    );
+
+  EXECUTE format(
+    'LOCK TABLE ONLY %I.%I IN ACCESS EXCLUSIVE MODE',
+    child_schema,
+    child_name
+  );
+  EXECUTE format(
+    'SELECT count(*) FROM ONLY %I.%I',
+    child_schema,
+    child_name
+  ) INTO n;
+
+  IF n <> $ROWS THEN
+    RAISE EXCEPTION 'purge mismatch for $DAY: partition rows % vs manifest $ROWS', n;
+  END IF;
+
+  EXECUTE format(
+    'ALTER TABLE %I.%I DETACH PARTITION %I.%I',
+    '$SCHEMA',
+    'trades',
+    child_schema,
+    child_name
+  );
+  EXECUTE format('DROP TABLE %I.%I', child_schema, child_name);
+  RAISE NOTICE 'purged $DAY via partition: % rows', n;
+END
+\$\$;"; then
+      echo "REFUSE $DAY: partition purge transaction did not commit" >&2
+      exit 1
+    fi
+
+    echo "PURGED $DAY rows=$ROWS"
+    exit 0
+    ;;
+  DEFAULT)
+    echo "REFUSE $DAY: target day resolves to default partition $TARGET_PARTITION_SCHEMA.$TARGET_PARTITION_NAME" >&2
+    exit 1
+    ;;
+  DELETE)
+    ;;
+  *)
+    echo "REFUSE $DAY: target day does not have one safe purge mapping" >&2
+    exit 1
+    ;;
+esac
+
 # Plain EXPLAIN only. The production DELETE is refused if its plan does not use
 # the event-time index. A tiny scratch table may legitimately choose a seq scan.
 PLAN=$("${PSQL[@]}" \
@@ -217,10 +493,72 @@ fi
 
 if ! "${PSQL[@]}" \
   -c "SET statement_timeout='$PURGE_STATEMENT_TIMEOUT'" \
+  -c "SET TIME ZONE 'UTC'" \
   -c "
 DO \$\$
-DECLARE n bigint;
+DECLARE
+  parent_oid oid;
+  parent_relkind "char";
+  n bigint;
 BEGIN
+  LOCK TABLE ONLY $RELATION IN SHARE UPDATE EXCLUSIVE MODE;
+
+  SELECT parent.oid, parent.relkind
+    INTO STRICT parent_oid, parent_relkind
+  FROM pg_catalog.pg_class parent
+  JOIN pg_catalog.pg_namespace parent_namespace
+    ON parent_namespace.oid = parent.relnamespace
+  WHERE parent_namespace.nspname = '$SCHEMA'
+    AND parent.relname = 'trades';
+
+  IF parent_relkind = 'p' THEN
+    IF NOT EXISTS (
+      SELECT 1
+      FROM pg_catalog.pg_partitioned_table partitioned
+      JOIN pg_catalog.pg_attribute key_column
+        ON key_column.attrelid = partitioned.partrelid
+       AND key_column.attnum = partitioned.partattrs[0]
+      WHERE partitioned.partrelid = parent_oid
+        AND partitioned.partstrat = 'r'
+        AND partitioned.partnatts = 1
+        AND partitioned.partexprs IS NULL
+        AND key_column.attname = 'executed_at'
+    ) THEN
+      RAISE EXCEPTION 'trades partition key changed before DELETE';
+    END IF;
+
+    IF NOT EXISTS (
+      SELECT 1
+      FROM pg_catalog.pg_inherits inheritance
+      JOIN pg_catalog.pg_class child
+        ON child.oid = inheritance.inhrelid
+      CROSS JOIN LATERAL pg_catalog.regexp_match(
+        pg_catalog.pg_get_expr(child.relpartbound, child.oid),
+        '^FOR VALUES FROM \((MINVALUE|''([^'']+)'')\) TO \((MAXVALUE|''([^'']+)'')\)$'
+      ) AS matched(parts)
+      WHERE inheritance.inhparent = parent_oid
+        AND child.relispartition
+        AND child.relkind = 'r'
+        AND pg_catalog.pg_get_expr(child.relpartbound, child.oid) <> format(
+          'FOR VALUES FROM (%L) TO (%L)',
+          '$LOWER'::timestamptz,
+          '$UPPER'::timestamptz
+        )
+        AND CASE
+              WHEN parts[1] = 'MINVALUE' THEN '-infinity'::timestamptz
+              ELSE parts[2]::timestamptz
+            END <= '$LOWER'::timestamptz
+        AND CASE
+              WHEN parts[3] = 'MAXVALUE' THEN 'infinity'::timestamptz
+              ELSE parts[4]::timestamptz
+            END >= '$UPPER'::timestamptz
+    ) THEN
+      RAISE EXCEPTION 'trades DELETE route for $DAY changed or resolves to default';
+    END IF;
+  ELSIF parent_relkind <> 'r' THEN
+    RAISE EXCEPTION 'unsupported trades relation kind before DELETE';
+  END IF;
+
   DELETE FROM $RELATION WHERE $PREDICATE;
   GET DIAGNOSTICS n = ROW_COUNT;
   IF n <> $ROWS THEN

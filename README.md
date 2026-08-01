@@ -14,10 +14,11 @@ append-only ledgers would conflict on every run.
 ## Why this exists as a repository at all
 
 These scripts delete production data. `purge-ticks-day.sh` and
-`purge-trades-day.sh` issue transactional `DELETE`s against tables holding
-hundreds of millions of rows, gated on a manifest they verify first. Until
-2026-07-29 they lived on one disk with no history, so a bad edit had no way
-back and no way to review. That is the gap this closes.
+`purge-trades-day.sh` either detach and drop an exact daily partition or issue a
+transactional `DELETE` for a day still inside a wider legacy partition. Both
+paths are gated on a manifest they verify first. Until 2026-07-29 the scripts
+lived on one disk with no history, so a bad edit had no way back and no way to
+review. That is the gap this closes.
 
 ## The safety contract every script here honours
 
@@ -28,8 +29,8 @@ back and no way to review. That is the gap this closes.
   the manifest, and `purge-trades-day.sh` additionally requires
   `ALLOW_PRODUCTION_TRADES_PURGE=YES` before it will touch `public`.
 - **Exports refuse a bad query plan.** `export-trades-day.sh` aborts if `EXPLAIN`
-  does not show `ix_trades_executed_at`; a sequential scan of the production
-  table is an outage, not a slow job.
+  does not show an index in the catalog-attached `executed_at` index family; a
+  sequential scan of the production table is an outage, not a slow job.
 - **The password is never echoed**, including under `bash -x`.
 - **Column order is pinned and immutable.** The restorer consumes the first three
   fields positionally, so `SELECT *` is unsafe — physical column order does not

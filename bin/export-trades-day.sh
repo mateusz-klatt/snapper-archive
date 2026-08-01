@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Export one UTC trade day by exchange event time.
+# Export one UTC trade day by exchange event time, guarded by the catalog's
+# partitioned executed_at index family before COPY is allowed on production.
 #
 # Archive format v1. The order is immutable because the restorer consumes the
 # first three fields positionally as public_id, timestamp, and known_to.
@@ -146,16 +147,75 @@ WHERE executed_at >= '$LOWER'::timestamptz
 ORDER BY executed_at, id"
 
 # This is deliberately plain EXPLAIN, never EXPLAIN ANALYZE. On production,
-# refuse to run COPY unless the exact export query plans through the event-time
-# index. A tiny scratch table may legitimately prefer a sequential scan.
+# refuse to run COPY unless the exact export query plans through an index in the
+# parent's executed_at index family. A tiny scratch table may legitimately
+# prefer a sequential scan.
 PLAN=$("${PSQL[@]}" \
   -c "SET statement_timeout='$EXPLAIN_STATEMENT_TIMEOUT'" \
   -c "EXPLAIN (COSTS ON, VERBOSE OFF) $QUERY")
 echo "EXPLAIN $SCHEMA.trades executed_at [$LOWER, $UPPER):"
 printf '%s\n' "$PLAN"
-if [[ "$SCHEMA" == "public" && "$PLAN" != *"ix_trades_executed_at"* ]]; then
-  echo "ABORT $DAY: EXPLAIN did not use ix_trades_executed_at; COPY was not run" >&2
-  exit 1
+if [[ "$SCHEMA" == "public" ]]; then
+  EVENT_TIME_INDEXES=$("${PSQL[@]}" \
+    -c "SET statement_timeout='$EXPLAIN_STATEMENT_TIMEOUT'" \
+    -c "
+WITH RECURSIVE event_time_indexes(index_oid) AS (
+  SELECT index_state.indexrelid
+  FROM pg_catalog.pg_class parent
+  JOIN pg_catalog.pg_namespace parent_namespace
+    ON parent_namespace.oid = parent.relnamespace
+  JOIN pg_catalog.pg_attribute key_column
+    ON key_column.attrelid = parent.oid
+   AND key_column.attname = 'executed_at'
+  JOIN pg_catalog.pg_index index_state
+    ON index_state.indrelid = parent.oid
+   AND index_state.indnkeyatts >= 1
+   AND index_state.indkey[0] = key_column.attnum
+   AND index_state.indexprs IS NULL
+   AND index_state.indpred IS NULL
+   AND index_state.indisvalid
+   AND index_state.indisready
+   AND index_state.indislive
+  WHERE parent_namespace.nspname = '$SCHEMA'
+    AND parent.relname = 'trades'
+
+  UNION ALL
+
+  SELECT inheritance.inhrelid
+  FROM event_time_indexes
+  JOIN pg_catalog.pg_inherits inheritance
+    ON inheritance.inhparent = event_time_indexes.index_oid
+)
+SELECT pg_catalog.quote_ident(index_relation.relname)
+FROM event_time_indexes
+JOIN pg_catalog.pg_class index_relation
+  ON index_relation.oid = event_time_indexes.index_oid
+JOIN pg_catalog.pg_index index_state
+  ON index_state.indexrelid = event_time_indexes.index_oid
+WHERE index_relation.relkind = 'i'
+  AND index_state.indisvalid
+  AND index_state.indisready
+  AND index_state.indislive
+ORDER BY index_relation.relname;") || {
+      echo "ABORT $DAY: could not inspect the trades event-time index family" >&2
+      exit 1
+    }
+
+  PLAN_USES_EVENT_TIME_INDEX=false
+  while IFS= read -r EVENT_TIME_INDEX; do
+    [[ -n "$EVENT_TIME_INDEX" ]] || continue
+    if [[ "$PLAN" == *"Index Scan using $EVENT_TIME_INDEX "* ||
+      "$PLAN" == *"Index Only Scan using $EVENT_TIME_INDEX "* ||
+      "$PLAN" == *"Bitmap Index Scan on $EVENT_TIME_INDEX "* ]]; then
+      PLAN_USES_EVENT_TIME_INDEX=true
+      break
+    fi
+  done <<<"$EVENT_TIME_INDEXES"
+
+  if [[ "$PLAN_USES_EVENT_TIME_INDEX" != "true" ]]; then
+    echo "ABORT $DAY: EXPLAIN did not use the trades executed_at index family; COPY was not run" >&2
+    exit 1
+  fi
 fi
 
 count_csv_rows() {
