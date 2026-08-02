@@ -1,0 +1,2 @@
+file	day	rows	bytes	sha256	note
+trades-2026-07-31.supplement-20260802.csv.zst	2026-07-31	3	337	ef2c334a8f6cb091fd5ec90a134896106a620deaf7a12cfbcb816dc3f579c4b9	incident-window trades recovered via weekend equities snapshots, absent from the daily file
