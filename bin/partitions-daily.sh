@@ -27,26 +27,50 @@ set -euo pipefail
 set +x
 
 ROOT=${SNAPPER_ARCHIVE_ROOT:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)}
-# Alarm threshold. The tool's own alarm trips at 7 and a healthy run leaves 13,
-# so 7 grants roughly six consecutive failures before anyone is woken up.
+# Fatal floor for CONTIGUOUS forward coverage counted from today. Distinct from
+# the target below: the target is what a healthy run maintains, this is the point
+# at which silence has gone on long enough to wake someone.
 FORWARD_MIN_DAYS=${FORWARD_MIN_DAYS:-7}
-# Per-table backward buffer, in days. These are NOT interchangeable.
-#   ticks   = 0. Its partition key is RECEIVE time, so late data still lands on
-#             the current day and a backward leaf buys nothing. It is also the
-#             only table whose leaves are dropped by cron, so a backward leaf
-#             for an already-exported day could take late rows that the export
-#             manifest says are done — wedging retention permanently. Zero
-#             removes that whole failure mode rather than guarding it.
-#   candles/trades = 4. Their keys are event time, nothing scheduled drops
-#             their leaves, and the observed arrival lag reaches four days.
-BACKFILL_DAYS_TICKS=${BACKFILL_DAYS_TICKS:-0}
-BACKFILL_DAYS_CANDLES=${BACKFILL_DAYS_CANDLES:-4}
-BACKFILL_DAYS_TRADES=${BACKFILL_DAYS_TRADES:-4}
-# A backward leaf must never reach a day that retention may already have
-# exported and dropped, or the two jobs fight over the same day.
+# Forward target. An empty leaf costs 16-48 kB (measured: ticks 16, candles 32,
+# trades 48) against 6.5 GB for one populated tick day, so a month of headroom is
+# free and removes the renewal deadline as a class of problem.
+FORWARD_DAYS=${FORWARD_DAYS:-30}
+# Backward buffer, per table. NOT interchangeable, and the asymmetry is the whole
+# point.
+#
+#   candles / trades = 30. Their keys are EVENT time, so genuinely late data
+#     belongs on an old day, and nothing scheduled destroys their leaves — the
+#     weekly candle sweep works on rows (SCD2 supersession), not partitions, and
+#     purge-trades-day.sh is not on cron. A wide window here is pure upside: it
+#     absorbs a historical backfill instead of parking it in DEFAULT, which
+#     blocks renewal for every table at once.
+#
+#   ticks = 6, and deliberately NOT 30. Ticks are the one table whose leaves cron
+#     DROPS. Recreating a leaf for a day retention has already exported and
+#     purged turns a loud failure into a jam: a late tick would land in that leaf
+#     instead of DEFAULT, retention skips the day because MANIFEST.tsv lists it,
+#     and the next purge attempt dies on `purge mismatch` (leaf rows vs manifest
+#     rows) — permanently, since retention exits on the first failure while ticks
+#     keep growing ~7.3 GB/day. Routing that tick to DEFAULT instead costs one
+#     alert and leaves retention working. The bound is therefore the retention
+#     horizon minus a day, enforced below rather than trusted.
+BACKFILL_DAYS_TICKS=${BACKFILL_DAYS_TICKS:-6}
+BACKFILL_DAYS_CANDLES=${BACKFILL_DAYS_CANDLES:-30}
+BACKFILL_DAYS_TRADES=${BACKFILL_DAYS_TRADES:-30}
+# Only ticks are cron-purged, so only ticks are clamped against this.
 RETENTION_HORIZON_DAYS=${RETENTION_HORIZON_DAYS:-7}
-ENSURE_RETRIES=${ENSURE_RETRIES:-3}
-ENSURE_RETRY_SLEEP=${ENSURE_RETRY_SLEEP:-60}
+# The tool's window is anchor..anchor+13 — a TOTAL span, not an open-ended
+# forward reach — so covering a wider range takes several anchors stepped by
+# this much.
+ANCHOR_STEP_DAYS=14
+# Retry shape, tuned against observed contention rather than guessed. The tool
+# takes the parent's ACCESS EXCLUSIVE lock with a 2s timeout and never retries
+# internally, while the candle publisher writes 44 pairs every minute — so the
+# lock is free only in short, REGULAR windows between writes. Many short
+# attempts therefore beat few long waits: 3x60s exhausted itself on candles
+# while 2x60s was enough for the quieter trades parent.
+ENSURE_RETRIES=${ENSURE_RETRIES:-8}
+ENSURE_RETRY_SLEEP=${ENSURE_RETRY_SLEEP:-20}
 # Warn when no run has succeeded for this long. This is what catches a stuck
 # lock: a skipped run exits 0 by design, so consecutive skips are otherwise
 # indistinguishable from healthy quiet.
@@ -156,6 +180,42 @@ forward_headroom() {
     WHERE leaves.day >= current_date AND leaves.day < first_gap.day"
 }
 
+missing_days() {
+  # Every day in [today-$2, today+$3] with no daily leaf, oldest first, one per
+  # line. This exists so the steady state costs ONE cheap catalog query instead
+  # of a CLI invocation per anchor: `ensure` is idempotent, but each call pays
+  # ~25s of application bootstrap whether or not it has work to do, and a
+  # ±30-day window needs five anchors per table.
+  sql_scalar "
+    WITH leaves AS (
+      SELECT to_date(right(c.relname, 8), 'YYYYMMDD') AS day
+      FROM pg_class c
+      JOIN pg_inherits i ON i.inhrelid = c.oid
+      JOIN pg_class p ON p.oid = i.inhparent
+      WHERE p.relname = '${1}'
+        AND c.relname ~ '^${1}_d[0-9]{8}\$'
+    )
+    SELECT to_char(g.d, 'YYYY-MM-DD')
+    FROM generate_series(current_date - ${2}, current_date + ${3}, interval '1 day') g(d)
+    WHERE NOT EXISTS (SELECT 1 FROM leaves l WHERE l.day = g.d::date)
+    ORDER BY g.d"
+}
+
+anchors_for() {
+  # Minimal anchor set covering the supplied missing days. Walks them in order
+  # and starts a new anchor only once the previous anchor's window has run out,
+  # so a scattered handful of gaps costs one call each while a contiguous month
+  # costs three.
+  local covered_until="" day
+  while read -r day; do
+    [ -n "$day" ] || continue
+    if [ -z "$covered_until" ] || [[ "$day" > "$covered_until" ]]; then
+      echo "$day"
+      covered_until=$(date -u -d "$day + $((ANCHOR_STEP_DAYS - 1)) days" +%F)
+    fi
+  done
+}
+
 run_ensure() {
   # One ensure call, retried: the tool takes the parent's ACCESS EXCLUSIVE lock
   # with a 2s timeout and does NOT retry internally, so it loses a coin flip
@@ -195,6 +255,56 @@ backfill_days_for() {
   esac
 }
 
+count_lines() {
+  # Count non-empty lines on stdin, ALWAYS succeeding.
+  #
+  # `grep -c .` prints 0 and exits 1 on empty input. That exit code is harmless
+  # inside `echo "$(...)"` but fatal inside an assignment: under `set -e` a
+  # failing command substitution in `X=$(...)` or `X=$(( $(...) ))` aborts the
+  # script on the spot, with no message, in the ordinary case where there is
+  # simply nothing to do. This exact class has now bitten three times in this
+  # file — reading DEFAULT counts, building the alert subject, and counting
+  # gaps — so it gets a named helper rather than another inline `|| true`.
+  grep -c . || true
+}
+
+manifest_for() {
+  # Archive ledger for this table, if it has one. Candles have no day-level
+  # manifest: the weekly sweep archives closed SCD2 versions, not whole days.
+  case "$1" in
+    ticks) echo "$ROOT/MANIFEST.tsv" ;;
+    trades) echo "$ROOT/TRADES-MANIFEST.tsv" ;;
+    *) echo "" ;;
+  esac
+}
+
+drop_archived_days() {
+  # Remove days already recorded in the archive ledger from a list of missing
+  # days, so this job never RESURRECTS a leaf for a day that has been exported
+  # and drained.
+  #
+  # This is the sharpest edge in the whole design. A recreated leaf for an
+  # archived day is worse than no leaf at all: late rows land in it instead of
+  # in DEFAULT, retention skips the day because the ledger lists it, so the rows
+  # are never archived — and the next purge attempt dies on `purge mismatch`
+  # (leaf rows vs ledger rows), which for ticks wedges retention permanently
+  # while the table grows ~7.3 GB/day. Routing those rows to DEFAULT instead
+  # costs one alert and keeps everything else running.
+  #
+  # A retention horizon alone does NOT cover this. Days get exported early, by
+  # hand or by a catch-up run, so an archived day can sit well inside the
+  # horizon — 2026-07-29..31 were exported on 08-01 with a 7-day horizon. And
+  # for trades the oldest surviving row (07-15) is OLDER than the archived range
+  # (07-22..31), so "do not predate the oldest row" would not have caught it
+  # either. The ledger is the only precise statement of what is already done.
+  local ledger="$1"
+  if [ -z "$ledger" ] || [ ! -r "$ledger" ]; then
+    cat
+    return 0
+  fi
+  grep -Fvx -f <(cut -f2 "$ledger" | sort -u) - || true
+}
+
 TODAY=$(date -u +%F)
 FAILED=()
 BLOCKED=()
@@ -204,11 +314,13 @@ for TABLE in ticks trades candles; do
   echo "== $TABLE $(date -u +%T)"
   BACK=$(backfill_days_for "$TABLE")
 
-  # A backward leaf inside retention's reach would let this job recreate a day
-  # that retention has already exported, archived and dropped. Clamp rather
-  # than refuse: the forward window is the part that must not be skipped.
-  if (( BACK > 0 && BACK >= RETENTION_HORIZON_DAYS )); then
-    echo "-- $TABLE backward buffer ${BACK}d reaches retention horizon ${RETENTION_HORIZON_DAYS}d, clamping"
+  # Only ticks are purged by cron, so only ticks are clamped: recreating a leaf
+  # for a day already exported and dropped would let a late tick land there
+  # instead of in DEFAULT, after which retention skips the day as manifested and
+  # the next purge dies on a row-count mismatch. Candles and trades have no
+  # scheduled leaf destroyer, so their wide window carries no such interaction.
+  if [ "$TABLE" = "ticks" ] && (( BACK >= RETENTION_HORIZON_DAYS )); then
+    echo "-- $TABLE backward ${BACK}d reaches the ${RETENTION_HORIZON_DAYS}d retention horizon, clamping"
     BACK=$(( RETENTION_HORIZON_DAYS - 1 ))
   fi
 
@@ -216,11 +328,32 @@ for TABLE in ticks trades candles; do
   # abort at the first blocked table and silently skip every later one — which
   # is exactly how a single non-empty DEFAULT could stop all renewal.
   TABLE_RC=0
-  run_ensure "$TABLE" "$TODAY" "forward" || TABLE_RC=$?
-  if (( BACK > 0 )); then
-    BACK_ANCHOR=$(date -u -d "today - ${BACK} days" +%F)
-    run_ensure "$TABLE" "$BACK_ANCHOR" "backward(${BACK}d)" || TABLE_RC=$?
+  GAPS=$(missing_days "$TABLE" "$BACK" "$FORWARD_DAYS" 2>&1) || GAPS="query-failed"
+  if [ "$GAPS" != "query-failed" ]; then
+    KEPT=$(printf '%s\n' "$GAPS" | drop_archived_days "$(manifest_for "$TABLE")")
+    DROPPED=$(( $(printf '%s\n' "$GAPS" | count_lines) - $(printf '%s\n' "$KEPT" | count_lines) ))
+    if (( DROPPED > 0 )); then
+      echo "-- $TABLE skipping ${DROPPED} day(s) already in the archive ledger (never resurrect an exported day)"
+    fi
+    GAPS="$KEPT"
   fi
+  case "$GAPS" in
+    query-failed*|*[!0-9$'\n'-]*)
+      echo "-- $TABLE FAILED to read the leaf window: ${GAPS}"
+      TABLE_RC=1
+      ;;
+    "")
+      echo "-- $TABLE window -${BACK}d..+${FORWARD_DAYS}d already complete, no DDL needed"
+      ;;
+    *)
+      ANCHORS=$(printf '%s\n' "$GAPS" | anchors_for)
+      echo "-- $TABLE missing $(printf '%s\n' "$GAPS" | count_lines) day(s), $(printf '%s\n' "$ANCHORS" | count_lines) anchor(s)"
+      while read -r A; do
+        [ -n "$A" ] || continue
+        run_ensure "$TABLE" "$A" "anchor ${A}" || TABLE_RC=$?
+      done <<<"$ANCHORS"
+      ;;
+  esac
 
   # `|| true` is load-bearing, not defensive clutter. Under `set -e` a failing
   # command substitution inside an assignment aborts the script outright — so a
