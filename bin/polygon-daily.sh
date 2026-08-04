@@ -144,6 +144,35 @@ SINCE=$(date -u -d "today - ${LOAD_LOOKBACK_DAYS} days" +%F)
 if [ -n "${SKIP_LOAD:-}" ]; then
   echo "-- PHASE 2 load SKIPPED (SKIP_LOAD set), SINCE=${SINCE} $(date -u +%T)"
 else
+  # Guarantee a home for every day this load is about to touch. A candle whose
+  # day has no partition falls into candles_default, and a non-empty DEFAULT
+  # makes `ensure` refuse outright — so the anomaly buffer that catches the
+  # stray rows is also what blocks the renewal that would have prevented them.
+  # That is how 921,878 rows accumulated: LOAD_LOOKBACK_DAYS reached back past
+  # the oldest daily leaf on three consecutive mornings and nothing noticed.
+  #
+  # The check belongs HERE rather than in the partition cron because the reach
+  # is not a constant. MIN_LOOKBACK_DAYS is only a floor; the real span is
+  # GAP_DAYS since the last committed snapshot, which is unbounded above. This
+  # script is the one that computes it, so it is the one that can size the
+  # window correctly. A fixed backward buffer elsewhere is a guess that a
+  # lagging submodule silently outgrows.
+  #
+  # Non-fatal on purpose: a refusal here means DEFAULT already holds rows, which
+  # needs an operator, not a skipped ingest.
+  # Stepped by 14 days because one ensure call covers anchor..anchor+13 — a
+  # TOTAL span, not an open-ended forward window. A single call at SINCE would
+  # leave the middle of a long catch-up uncovered: with a gap of twenty days,
+  # SINCE+13 still falls a week short of today.
+  echo "-- PHASE 2 partitions ${SINCE}..$(date -u +%F) $(date -u +%T)"
+  PART_ANCHOR="$SINCE"
+  PART_TODAY=$(date -u +%F)
+  while [[ "$PART_ANCHOR" < "$PART_TODAY" || "$PART_ANCHOR" == "$PART_TODAY" ]]; do
+    .venv/bin/snapper daily-partitions ensure candles \
+      --anchor "${PART_ANCHOR}T00:00:00+00:00" --apply \
+      || echo "WARN: candles partitions not ensured at ${PART_ANCHOR} (drain candles_default?)"
+    PART_ANCHOR=$(date -u -d "$PART_ANCHOR + 14 days" +%F)
+  done
   echo "-- PHASE 2 load since ${SINCE} $(date -u +%T)"
   .venv/bin/snapper polygon-load-csv --all -t minute --since "$SINCE"
   echo "load rc=$? elapsed_total=$(( ($(date -u +%s) - STARTED) / 60 ))min"
