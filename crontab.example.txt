@@ -1,4 +1,7 @@
-MAILTO=""
+# Backstop only — see SNAPPER_ALERT_EMAIL below for the real alert channel.
+# The scripts redirect their own output, so cron mails only what happens BEFORE
+# that redirect: a missing file, a syntax error, a failed exec, an OOM kill.
+MAILTO="root"
 
 # Installation-specific values. Replace every placeholder before installing
 # this crontab. SNAPPER_ARCHIVE_ROOT is explicit here for operational clarity;
@@ -12,12 +15,20 @@ SNAPPER_DB_HOST_TO="host-reachable-from-cron-host"
 SNAPPER_GITLINK_REMOTES="origin secondary-mirror"
 # Where failure alerts are mailed. Leave unset to keep every job log-only.
 #
-# This is deliberately NOT MAILTO. Setting MAILTO would achieve nothing here:
-# every script in bin/ runs `exec >>"$LOG" 2>&1` on startup, so cron receives no
-# output to mail, ever — a job can fail every night in total silence, and one
-# did for two weeks. The scripts therefore mail their own failures explicitly.
-# Delivery uses the system `mail` command, exactly as cron would.
-SNAPPER_ALERT_EMAIL="alerts@example.invalid"
+# This is NOT a substitute for MAILTO, and MAILTO is not a substitute for it —
+# they catch different failures. Every script in bin/ runs `exec >>"$LOG" 2>&1`
+# on startup, so cron has no output to mail for anything that happens after that
+# line: a job can fail every night in total silence, and one did for two weeks.
+# The scripts therefore mail their own failures explicitly, through this address.
+# MAILTO below then remains as the backstop for what a script cannot report
+# itself — missing file, syntax error, a failed `exec`, an OOM kill.
+#
+# "root" resolves through /etc/aliases (msmtp expands it when msmtprc sets
+# `aliases /etc/aliases`). Naming the alias rather than a person keeps the real
+# destination in exactly one place on the host, and keeps this file free of a
+# personal address. Cron does NOT expand variables in this block, so MAILTO
+# cannot reference this value — both are written literally.
+SNAPPER_ALERT_EMAIL="root"
 
 # Snapper data retention. Logs: ${SNAPPER_ARCHIVE_ROOT}/logs/
 #
