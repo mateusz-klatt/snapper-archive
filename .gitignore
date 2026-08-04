@@ -24,3 +24,8 @@
 /.candles.lock
 /.polygon.lock
 /.trades-archive.lock
+/.partitions.lock
+# Runtime health stamp: the epoch of the last fully successful partition run.
+# It is how a run detects that the previous ones only ever skipped on a held
+# lock, which otherwise looks identical to a healthy quiet day.
+/.partitions.last-success

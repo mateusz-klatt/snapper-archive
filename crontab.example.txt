@@ -10,6 +10,14 @@ SNAPPER_APP_ROOT="/absolute/path/to/snapper"
 SNAPPER_DB_HOST_FROM="host-as-written-in-DB_URL"
 SNAPPER_DB_HOST_TO="host-reachable-from-cron-host"
 SNAPPER_GITLINK_REMOTES="origin secondary-mirror"
+# Where failure alerts are mailed. Leave unset to keep every job log-only.
+#
+# This is deliberately NOT MAILTO. Setting MAILTO would achieve nothing here:
+# every script in bin/ runs `exec >>"$LOG" 2>&1` on startup, so cron receives no
+# output to mail, ever — a job can fail every night in total silence, and one
+# did for two weeks. The scripts therefore mail their own failures explicitly.
+# Delivery uses the system `mail` command, exactly as cron would.
+SNAPPER_ALERT_EMAIL="alerts@example.invalid"
 
 # Snapper data retention. Logs: ${SNAPPER_ARCHIVE_ROOT}/logs/
 #
@@ -36,3 +44,14 @@ SNAPPER_GITLINK_REMOTES="origin secondary-mirror"
 17 3 * * * "${SNAPPER_ARCHIVE_ROOT}/bin/retention-daily.sh"
 # Weekly Sun 04:30 local: sweep closed SCD2 candle versions across the full history.
 30 4 * * 0 "${SNAPPER_ARCHIVE_ROOT}/bin/retention-weekly-candles.sh"
+# Daily 12:17 local: renew the forward window of daily partitions and report
+# DEFAULT occupancy. Nothing renewed partitions at all until this job existed;
+# the leaves that were there came from the migration that created them.
+#
+# Midday, not night, and clear of BOTH neighbours on purpose. The 03:17
+# retention job holds ACCESS EXCLUSIVE on the ticks parent while it counts a
+# multi-million-row leaf, and the 05:00 polygon job writes candles until roughly
+# 08:30; the partition tool takes that same parent lock with a 2s timeout, so an
+# overlap would fail it for no reason. The hour is otherwise free: a 14-day
+# forward window makes coverage independent of when the job fires.
+17 12 * * * "${SNAPPER_ARCHIVE_ROOT}/bin/partitions-daily.sh"

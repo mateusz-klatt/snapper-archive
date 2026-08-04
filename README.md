@@ -43,6 +43,43 @@ That is the gap this closes.
     TRADES-MANIFEST.tsv  trades ledger, keyed by day (ignored)
     logs/                run logs (ignored)
 
+## Partition renewal needs two anchors, and the tool's own count lies
+
+`partitions-daily.sh` keeps the forward window of daily leaves alive. Two things
+about it are counter-intuitive enough to be worth stating before someone
+"simplifies" them.
+
+**Two `ensure` calls per table is not redundant.** The tool's window is
+`anchor .. anchor+13` — a total span, not "N days back plus fourteen forward".
+Anchoring in the past therefore buys backward coverage *out of* forward headroom
+rather than adding to it. Measured against a live database: `--anchor today`
+planned two new leaves at the forward edge, while `--anchor today-4` planned
+exactly one backward leaf and nothing forward at all.
+
+**Never report headroom from the tool's "future daily leaves".** It counts
+leaves at or after the *anchor*, so a past anchor over-reports by the width of
+the backward window — the same database that genuinely had eleven days of
+forward cover reported sixteen. The script computes headroom itself, as
+contiguous daily leaves starting at today, in UTC.
+
+**The backward buffer is per table, and zero for ticks.** Tick partitions key on
+receive time, so late data still lands on the current day and a backward leaf
+buys nothing; ticks is also the only table whose leaves this repository drops,
+so a backward leaf for an already-exported day could accept rows the manifest
+already calls done — wedging retention permanently. Candles and trades key on
+event time, nothing scheduled drops their leaves, and they get four days.
+
+**A nonzero exit is not an alert.** Every script here redirects its own output to
+a monthly log on startup, so cron has nothing to mail and `MAILTO` would change
+nothing. Failures are mailed explicitly via `SNAPPER_ALERT_EMAIL`, and a run
+that only ever skips on a held lock is caught by a last-success stamp — a skip
+exits zero by design and is otherwise indistinguishable from a quiet healthy day.
+
+**DDL goes through the application CLI, never hand-written SQL.** A bare
+`CREATE TABLE ... PARTITION OF` inherits the parent's indexes but silently omits
+the leaf-local primary key and the active-`public_id` unique index. Two leaves
+created by hand this way carried no primary key at all until it was noticed.
+
 ## Day-slicing differs by table, and it matters
 
 Ticks are sliced by **bus time** and bracketed by binary search on `id`, which is
