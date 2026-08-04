@@ -23,6 +23,13 @@ exec 9>"$ROOT/.retention.lock"
 flock -n 9 || { echo "$(date -u +%FT%TZ) SKIP: another retention run holds the lock" >>"$LOG"; exit 0; }
 exec >>"$LOG" 2>&1
 
+# Failure alerting. Sourced AFTER the flock check so a legitimate skip never
+# pages anyone, and after the redirect so there is a log to summarise. A missing
+# helper is fatal on purpose: this job's failures would otherwise go nowhere,
+# and cron's MAILTO still catches an abort at this point.
+. "$(dirname -- "${BASH_SOURCE[0]}")/_alert.sh"
+snapper_alert_on_failure "retention-daily" "$LOG"
+
 echo "=== retention-daily $(date -u +%FT%TZ) horizon=${HORIZON_DAYS}d ==="
 
 FREE_GB=$(df -BG --output=avail "$ROOT" | tail -1 | tr -dc '0-9')

@@ -56,6 +56,13 @@ exec 9>"$ROOT/.polygon.lock"
 flock -n 9 || { echo "$(date -u +%FT%TZ) SKIP: another polygon run holds the lock" >>"$LOG"; exit 0; }
 exec >>"$LOG" 2>&1
 
+# Failure alerting. Sourced AFTER the flock check so a legitimate skip never
+# pages anyone, and after the redirect so there is a log to summarise. A missing
+# helper is fatal on purpose: this job's failures would otherwise go nowhere,
+# and cron's MAILTO still catches an abort at this point.
+. "$(dirname -- "${BASH_SOURCE[0]}")/_alert.sh"
+snapper_alert_on_failure "polygon-daily" "$LOG"
+
 STARTED=$(date -u +%s)
 
 # Days since the last committed snapshot, floored at MIN_LOOKBACK_DAYS. The
@@ -319,3 +326,21 @@ else
 fi
 
 echo "=== polygon-daily done $(date -u +%FT%TZ) ==="
+
+# Every phase above deliberately carries on past its own failure — a partial
+# ingest beats none, and that is the right call. The side effect was that a
+# partial failure ended the run with status 0 and lived only in a log nobody
+# read. Count THIS run's own failure markers and exit non-zero so the alert
+# fires, without changing any phase's decision to continue.
+#
+# Matched narrowly on purpose. The application's `WARNING` lines are ~20 per run
+# (unmapped archive symbols, entirely routine) and counting them would page
+# someone every single morning; they also carry a leading timestamp, so an
+# anchored pattern excludes them. `FAILED` and `ABORT` have appeared zero times
+# in the last fifteen runs, which is what makes them a usable signal.
+PROBLEMS=$(awk '/^=== polygon-daily [0-9]/ { buf = "" } { buf = buf $0 "\n" } END { printf "%s", buf }' "$LOG" \
+  | grep -cE '^(ABORT|WARN:|[a-z]+: FAILED|gitlink: !!)' || true)
+if [ "${PROBLEMS:-0}" -gt 0 ]; then
+  echo "polygon-daily finished with ${PROBLEMS} problem line(s) — see above"
+  exit 1
+fi

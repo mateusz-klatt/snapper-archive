@@ -17,6 +17,13 @@ exec 9>"$ROOT/.candles.lock"
 flock -n 9 || { echo "$(date -u +%FT%TZ) SKIP: another candle sweep holds the lock" >>"$LOG"; exit 0; }
 exec >>"$LOG" 2>&1
 
+# Failure alerting. Sourced AFTER the flock check so a legitimate skip never
+# pages anyone, and after the redirect so there is a log to summarise. A missing
+# helper is fatal on purpose: this job's failures would otherwise go nowhere,
+# and cron's MAILTO still catches an abort at this point.
+. "$(dirname -- "${BASH_SOURCE[0]}")/_alert.sh"
+snapper_alert_on_failure "candles-sweep" "$LOG"
+
 FROM=${FROM:-2023-01-01}
 TO=${TO:-$(date -u -d "today - 7 days" +%F)}
 echo "=== candles sweep $(date -u +%FT%TZ) range=$FROM..$TO ==="

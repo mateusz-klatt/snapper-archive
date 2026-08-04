@@ -56,25 +56,16 @@ LOG="$ROOT/logs/partitions-$(date -u +%Y-%m).log"
 STAMP="$ROOT/.partitions.last-success"
 mkdir -p "$ROOT/logs"
 
-# Alert channel. Empty means "log only" so the script stays usable on a host
-# with no mail; the installation supplies the address from the crontab
-# environment, never from this file.
-ALERT_EMAIL=${SNAPPER_ALERT_EMAIL:-}
+# Alert channel. The address comes from the crontab environment, never from this
+# file; an empty value leaves the job log-only so it stays usable on a host with
+# no mail. Sourced before the flock check because the skip branch below can
+# itself need to raise an alarm.
+. "$(dirname -- "${BASH_SOURCE[0]}")/_alert.sh"
 
 notify() {
-  # Mail one failure summary with the tail of this run's log as the body.
   # Deliberately NOT wired to `trap ... ERR`: a lock skip is a legitimate exit 0
-  # and must not page anyone, and a trap cannot tell the two apart.
-  local subject="$1"
-  [ -n "$ALERT_EMAIL" ] || return 0
-  command -v mail >/dev/null 2>&1 || return 0
-  # Only this run's own lines. A raw tail is mostly the application's startup
-  # chatter — the first alert sent read as forty lines of SDK banners with the
-  # actual refusal buried inside, which is unreadable on a phone at 03:00.
-  awk '/^=== partitions-daily [0-9]/ { buf = "" } { buf = buf $0 "\n" } END { printf "%s", buf }' "$LOG" \
-    | grep -E '^(===|==|--|OK|WARN|ABORT|Snapper|refused:)' \
-    | tail -n 40 \
-    | mail -s "$subject" "$ALERT_EMAIL" || true
+  # and must not page anyone, and ERR cannot tell the two apart.
+  snapper_alert "$1" "$LOG" '^=== partitions-daily [0-9]'
 }
 
 stale_success_days() {
