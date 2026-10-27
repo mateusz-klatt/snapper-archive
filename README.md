@@ -104,6 +104,17 @@ repository auto-merge must be enabled. Branch protection, required checks and
 reviews continue to apply; the script neither approves its own PR nor uses an
 administrator bypass.
 
+Every GitHub PR operation is explicitly bound with `--repo` to the canonical
+`github.com/owner/repository` identity parsed from the raw Git
+`remote.origin.url`. Git's transport rewrites do not change that logical identity.
+The helper ignores `gh repo set-default`, `GH_REPO` and `GH_HOST`. It supports
+GitHub.com SCP-style SSH URLs, `ssh://git@github.com/` URLs and HTTPS URLs.
+HTTPS user information, query strings and fragments are discarded in shell
+memory; raw origin URLs are never passed to GitHub CLI or printed. Unsupported
+hosts, paths and multiple origin URLs fail before publication instead of
+selecting another repository. No additional configuration variable can redirect
+this repository binding.
+
 Publication follows these rules:
 
 - The selected Polygon checkout must be initialized and its `HEAD` must exactly

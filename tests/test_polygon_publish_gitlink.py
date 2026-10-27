@@ -17,6 +17,9 @@ PUBLISHER = ROOT / "bin" / "polygon-publish-gitlink.sh"
 BRANCH = "automation/polygon-gitlink"
 MARKER = "Snapper-Automation: polygon-gitlink-v1"
 PR_MARKER = "<!-- snapper-polygon-gitlink:v1 -->"
+GH_REPOSITORY = "github.com/offline/snapper"
+GH_DECOY = "github.com/offline/decoy"
+ORIGIN_URL = "git@github.com:offline/snapper.git"
 
 
 class GhState(TypedDict):
@@ -40,12 +43,29 @@ import sys
 from pathlib import Path
 
 
-def git(*args: str) -> str:
-    """Execute the actual Git binary only against the local canonical bare repository."""
+def git(repository: str, *args: str) -> str:
+    """Execute the actual Git binary only against a selected local bare repository."""
     return subprocess.check_output(
-        [os.environ["MOCK_REAL_GIT"], "--git-dir", os.environ["MOCK_GH_ORIGIN"], *args],
+        [os.environ["MOCK_REAL_GIT"], "--git-dir", repository, *args],
         text=True,
     ).strip()
+
+
+def repository_binding(args: list[str]) -> str:
+    """Model an explicit selector or the conflicting configured GitHub default."""
+    if "--repo" in args:
+        return args[args.index("--repo") + 1]
+    default = subprocess.check_output(
+        [os.environ["MOCK_REAL_GIT"], "config", "--get", "remote.shadow.gh-resolved"],
+        text=True,
+    ).strip()
+    if default != "base":
+        raise ValueError("Synthetic configured default is unavailable")
+    raw = subprocess.check_output(
+        [os.environ["MOCK_REAL_GIT"], "config", "--get", "remote.shadow.url"],
+        text=True,
+    ).strip()
+    return raw.removeprefix("git@").replace(":", "/", 1).removesuffix(".git")
 
 
 def main() -> int:
@@ -58,17 +78,27 @@ def main() -> int:
         return 90
     if len(args) < 2 or args[0] != "pr":
         return 91
-    path = Path(os.environ["MOCK_GH_STATE"])
+    if os.environ.get("GH_REPO") or os.environ.get("GH_HOST"):
+        return 94
+    repository = repository_binding(args)
+    with Path(os.environ["MOCK_GH_BINDINGS"]).open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps({"repository": repository, "operation": args[1]}) + "\n")
+    if repository == "github.com/offline/snapper":
+        origin = os.environ["MOCK_GH_ORIGIN"]
+        path = Path(os.environ["MOCK_GH_STATE"])
+    elif repository == "github.com/offline/decoy":
+        origin = os.environ["MOCK_GH_DECOY_ORIGIN"]
+        path = Path(os.environ["MOCK_GH_DECOY_STATE"])
+    else:
+        return 95
     state = json.loads(path.read_text())
     operation = args[1]
-    if os.environ.get("GH_REPO"):
-        return 94
     if state["fail_operation"] == operation:
         return 7
     branch = "refs/heads/automation/polygon-gitlink"
     if operation == "list":
         if state["open"]:
-            head = git("rev-parse", branch)
+            head = git(origin, "rev-parse", branch)
             print(
                 f'{state["number"]}\t{head}\t'
                 f'{str(state["managed"]).lower()}\t'
@@ -81,7 +111,7 @@ def main() -> int:
         body = Path(args[args.index("--body-file") + 1]).read_text()
         if "<!-- snapper-polygon-gitlink:v1 -->" not in body:
             return 9
-        git("rev-parse", branch)
+        git(origin, "rev-parse", branch)
         state["open"] = True
         state["managed"] = True
         state["cross_repository"] = False
@@ -99,20 +129,20 @@ def main() -> int:
         required = {"--merge", "--match-head-commit"}
         if not required.issubset(args) or not state["open"]:
             return 11
-        head = git("rev-parse", branch)
+        head = git(origin, "rev-parse", branch)
         expected = args[args.index("--match-head-commit") + 1]
         if expected != head or state["fail_operation"] == "match_head":
             return 12
         if state["fail_operation"] == "auto_clean" and "--auto" in args:
             return 13
         if state["merge_immediately"] or state["fail_operation"] == "auto_clean":
-            base = git("rev-parse", "refs/heads/master")
-            tree = git("rev-parse", f"{head}^{{tree}}")
+            base = git(origin, "rev-parse", "refs/heads/master")
+            tree = git(origin, "rev-parse", f"{head}^{{tree}}")
             merged = git(
-                "commit-tree", tree, "-p", base, "-p", head,
+                origin, "commit-tree", tree, "-p", base, "-p", head,
                 "-m", "Synthetic policy-approved merge",
             )
-            git("update-ref", "refs/heads/master", merged, base)
+            git(origin, "update-ref", "refs/heads/master", merged, base)
             state["open"] = False
             path.write_text(json.dumps(state))
         return 0
@@ -127,6 +157,7 @@ if __name__ == "__main__":
 GIT_SCRIPT = r'''#!/usr/bin/env python3
 """Enforce no-force pushes and optionally inject a concurrent local branch advance."""
 
+import json
 import os
 import subprocess
 import sys
@@ -136,6 +167,9 @@ from pathlib import Path
 def main() -> None:
     """Forward Git with unchanged arguments after a deterministic race injection."""
     args = sys.argv[1:]
+    if "fetch" in args or "push" in args:
+        with Path(os.environ["MOCK_GIT_ACTIONS"]).open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(args) + "\n")
     if "push" in args:
         forbidden = any(
             value in {"--force", "-f"}
@@ -174,13 +208,17 @@ class PublisherTests(unittest.TestCase):
         self.app = self.base / "app"
         self.child = self.app / "data" / "polygon"
         self.origin = self.base / "canonical.git"
+        self.decoy_origin = self.base / "decoy.git"
         self.mirror = self.base / "mirror.git"
         self.child_origin = self.base / "child.git"
         self.archive = self.base / "archive"
         self.bin = self.base / "bin"
         self.home = self.base / "home"
         self.state_path = self.base / "gh-state.json"
+        self.decoy_state_path = self.base / "gh-decoy-state.json"
         self.calls_path = self.base / "gh-calls.jsonl"
+        self.bindings_path = self.base / "gh-bindings.jsonl"
+        self.git_actions = self.base / "git-actions.jsonl"
         self.counter = self.archive / ".polygon-gitlink-fails"
         self.forbidden_push = self.base / "forbidden-push"
         self.race_done = self.base / "race-done"
@@ -214,8 +252,12 @@ class PublisherTests(unittest.TestCase):
             "SNAPPER_GITLINK_REMOTES": "origin mirror",
             "MOCK_REAL_GIT": self.real_git,
             "MOCK_GH_ORIGIN": str(self.origin),
+            "MOCK_GH_DECOY_ORIGIN": str(self.decoy_origin),
             "MOCK_GH_STATE": str(self.state_path),
+            "MOCK_GH_DECOY_STATE": str(self.decoy_state_path),
             "MOCK_GH_CALLS": str(self.calls_path),
+            "MOCK_GH_BINDINGS": str(self.bindings_path),
+            "MOCK_GIT_ACTIONS": str(self.git_actions),
             "MOCK_FORBIDDEN_PUSH": str(self.forbidden_push),
             "MOCK_GIT_RACE_DONE": str(self.race_done),
         }
@@ -225,8 +267,18 @@ class PublisherTests(unittest.TestCase):
         ]:
             path.write_text(source)
             path.chmod(0o755)
+        self.create_repositories()
+
+    def create_repositories(self) -> None:
+        """Seed local repositories and conflicting raw GitHub identities for the CLI."""
         self.write_state()
-        for repository in [self.origin, self.mirror, self.child_origin]:
+        self.decoy_state_path.write_text(self.state_path.read_text())
+        for repository in [
+            self.origin,
+            self.decoy_origin,
+            self.mirror,
+            self.child_origin,
+        ]:
             self.git(
                 self.base,
                 "init",
@@ -259,7 +311,14 @@ class PublisherTests(unittest.TestCase):
         )
         self.git(self.app, "commit", "--quiet", "-m", "Initial application fixture")
         self.initial_master = self.rev(self.app, "HEAD")
-        self.git(self.app, "remote", "add", "origin", str(self.origin))
+        self.git(self.app, "remote", "add", "origin", ORIGIN_URL)
+        self.git(
+            self.app, "config", "--add", f"url.{self.origin}.insteadOf", ORIGIN_URL
+        )
+        self.git(
+            self.app, "remote", "add", "shadow", "git@github.com:offline/decoy.git"
+        )
+        self.git(self.app, "config", "remote.shadow.gh-resolved", "base")
         self.git(self.app, "remote", "add", "mirror", str(self.mirror))
         self.git(self.app, "push", "--quiet", "origin", "master")
         self.git(self.app, "push", "--quiet", "mirror", "master")
@@ -271,6 +330,7 @@ class PublisherTests(unittest.TestCase):
             self.assertFalse(
                 self.forbidden_push.exists(), "Publisher attempted a force push"
             )
+            self.assert_canonical_gh_calls()
         finally:
             self.temporary.cleanup()
 
@@ -342,6 +402,22 @@ class PublisherTests(unittest.TestCase):
             for line in self.calls_path.read_text().splitlines()
         ]
         return [value for value in values if value[:2] == ["pr", operation]]
+
+    def assert_canonical_gh_calls(self) -> None:
+        """Require every publisher API call to explicitly select canonical host and repo."""
+        for operation in ["list", "create", "merge", "close"]:
+            for call in self.calls(operation):
+                self.assertEqual(call.count("--repo"), 1, call)
+                self.assertEqual(call[call.index("--repo") + 1], GH_REPOSITORY, call)
+        if self.bindings_path.exists():
+            for line in self.bindings_path.read_text().splitlines():
+                binding = cast(dict[str, str], json.loads(line))
+                self.assertEqual(binding["repository"], GH_REPOSITORY)
+
+    def replace_origin(self, url: str) -> None:
+        """Set a raw origin identity while keeping all transport on local fixture paths."""
+        self.git(self.app, "remote", "set-url", "origin", url)
+        self.git(self.app, "config", "--add", f"url.{self.origin}.insteadOf", url)
 
     def advance_child(self, *, publish: bool = True) -> str:
         """Create a synthetic child snapshot, optionally leaving it unpublished."""
@@ -523,6 +599,123 @@ class PublisherTests(unittest.TestCase):
         self.assertTrue(self.state()["open"])
         self.assertIn("--auto", self.calls("merge")[0])
         self.assertIn("--match-head-commit", self.calls("merge")[0])
+
+    def test_explicit_repository_ignores_configured_and_ambient_defaults(self) -> None:
+        """Conflicting CLI defaults cannot redirect creation, merge or stale closure."""
+        self.assertEqual(
+            self.git(self.app, "config", "--get", "remote.shadow.gh-resolved"),
+            "base",
+        )
+        self.assertEqual(self.env["GH_HOST"], "example.invalid")
+        self.assertEqual(self.env["GH_REPO"], "unrelated/ambient-fixture")
+        self.assert_success(self.invoke())
+        self.publish_canonical(child=self.target)
+        self.assert_success(self.invoke())
+        for operation in ["list", "create", "merge", "close"]:
+            self.assertTrue(self.calls(operation), operation)
+        self.assert_canonical_gh_calls()
+        decoy = cast(GhState, json.loads(self.decoy_state_path.read_text()))
+        self.assertFalse(decoy["open"])
+        self.assertFalse((self.decoy_origin / "refs" / "heads" / "master").exists())
+
+    def test_mock_without_repo_binds_the_conflicting_default_to_decoy(self) -> None:
+        """The CLI double must reproduce the wrong-repository behavior it guards."""
+        state = cast(dict[str, object], json.loads(self.decoy_state_path.read_text()))
+        state["fail_operation"] = "list"
+        self.decoy_state_path.write_text(json.dumps(state))
+        bindings = self.base / "probe-bindings.jsonl"
+        env = dict(self.env)
+        env.pop("GH_REPO")
+        env.pop("GH_HOST")
+        env.update(
+            MOCK_GH_CALLS=str(self.base / "probe-calls.jsonl"),
+            MOCK_GH_BINDINGS=str(bindings),
+        )
+        result = subprocess.run(
+            [str(self.bin / "gh"), "pr", "list"],
+            cwd=self.app,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 7, result.stdout + result.stderr)
+        binding = cast(dict[str, str], json.loads(bindings.read_text()))
+        self.assertEqual(binding["repository"], GH_DECOY)
+        self.assertFalse(self.state()["open"])
+
+    def test_ssh_origins_bind_raw_identity_before_local_url_rewriting(self) -> None:
+        """Both normal SSH URL forms select GitHub despite their local transport rewrite."""
+        for url in [
+            "ssh://git@github.com/offline/snapper.git",
+            "ssh://git@github.com:22/offline/snapper.git",
+        ]:
+            with self.subTest(url=url):
+                self.replace_origin(url)
+                self.assertEqual(
+                    self.git(self.app, "config", "--get-all", "remote.origin.url"),
+                    url,
+                )
+                self.assertEqual(
+                    self.git(self.app, "remote", "get-url", "origin"),
+                    str(self.origin),
+                )
+                self.assert_success(self.invoke())
+                self.assert_canonical_gh_calls()
+
+    def test_https_origin_secrets_and_query_never_reach_output_or_gh(self) -> None:
+        """Synthetic userinfo, query and fragment are excluded from every API selector."""
+        sentinels = ["SYNTHETIC_USER", "SYNTHETIC_PASSWORD", "SYNTHETIC_QUERY"]
+        for host in ["github.com", "github.com:443"]:
+            with self.subTest(host=host):
+                url = (
+                    f"https://{sentinels[0]}:{sentinels[1]}@{host}"
+                    f"/offline/snapper.git?token={sentinels[2]}#SYNTHETIC_FRAGMENT"
+                )
+                self.replace_origin(url)
+                self.assertEqual(
+                    self.git(self.app, "config", "--get-all", "remote.origin.url"),
+                    url,
+                )
+                result = self.invoke()
+                self.assert_success(result)
+                observed = result.stdout + result.stderr + self.calls_path.read_text()
+                for sentinel in [*sentinels, "SYNTHETIC_FRAGMENT"]:
+                    self.assertNotIn(sentinel, observed)
+                self.assert_canonical_gh_calls()
+
+    def test_unsupported_origins_fail_before_any_fetch_or_api_action(self) -> None:
+        """Unsupported identity formats fail even when a local rewrite could fetch them."""
+        for url in [
+            str(self.origin),
+            "git@gitlab.com:offline/snapper.git",
+            "ssh://git@github.com:2222/offline/snapper.git",
+            "https://github.com.evil.invalid/offline/snapper.git",
+            "https://github.com@evil.invalid/offline/snapper.git",
+            "https://github.com/offline/snapper/extra.git",
+        ]:
+            with self.subTest(url=url):
+                self.counter.unlink(missing_ok=True)
+                self.replace_origin(url)
+                self.assert_first_failure(self.invoke())
+                self.assertFalse(self.git_actions.exists())
+                self.assertFalse(self.calls_path.exists())
+                self.assertFalse(self.branch_exists())
+
+    def test_multiple_origins_fail_before_any_fetch_or_api_action(self) -> None:
+        """An ambiguous canonical origin cannot silently select one configured URL."""
+        self.git(
+            self.app,
+            "config",
+            "--add",
+            "remote.origin.url",
+            "https://github.com/offline/decoy.git",
+        )
+        self.assert_first_failure(self.invoke())
+        self.assertFalse(self.git_actions.exists())
+        self.assertFalse(self.calls_path.exists())
+        self.assertFalse(self.branch_exists())
 
     def test_pending_age_survives_an_update_and_reminds_after_a_day(self) -> None:
         """An old accepted PR keeps its first queue time without becoming a failure."""

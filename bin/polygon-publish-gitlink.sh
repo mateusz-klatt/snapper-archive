@@ -4,7 +4,7 @@ set -Eeuo pipefail
 set +x
 umask 077
 export LC_ALL=C GIT_TERMINAL_PROMPT=0 GH_PROMPT_DISABLED=1
-unset GIT_INDEX_FILE GIT_WORK_TREE GIT_DIR GH_REPO
+unset GIT_INDEX_FILE GIT_WORK_TREE GIT_DIR GH_REPO GH_HOST
 
 ROOT=${SNAPPER_ARCHIVE_ROOT:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)}
 REPO=${SNAPPER_APP_ROOT:-}
@@ -22,6 +22,7 @@ PR_HEAD=""
 AUTO_HEAD=""
 BASE=""
 SUB=""
+GH_REPOSITORY=""
 
 failure() {
   local count
@@ -75,6 +76,49 @@ CHILD_TOP=$(git -C "$CHILD" rev-parse --show-toplevel 2>/dev/null) || failure 'P
   || failure 'Polygon submodule is not initialized'
 cd -- "$REPO" || failure 'application checkout is unavailable'
 
+resolve_github_repository() {
+  local raw remainder authority host path owner name
+  raw=$(git config --get-all remote.origin.url 2>/dev/null) \
+    || failure 'cannot read the canonical origin identity'
+  [[ -n "$raw" && "$raw" != *$'\n'* && "$raw" != *$'\r'* ]] \
+    || failure 'origin must have one supported GitHub URL'
+  # Normalize in shell memory; raw URLs may contain credentials or query data.
+  raw=${raw%%\?*}
+  raw=${raw%%\#*}
+  case "$raw" in
+    git@github.com:*)
+      path=${raw#git@github.com:}
+      ;;
+    ssh://git@github.com/*)
+      path=${raw#ssh://git@github.com/}
+      ;;
+    ssh://git@github.com:22/*)
+      path=${raw#ssh://git@github.com:22/}
+      ;;
+    https://*)
+      remainder=${raw#https://}
+      [[ "$remainder" = */* ]] || failure 'unsupported canonical GitHub origin'
+      authority=${remainder%%/*}
+      host=${authority##*@}
+      [[ "$host" = github.com || "$host" = github.com:443 ]] \
+        || failure 'unsupported canonical GitHub origin'
+      path=${remainder#*/}
+      ;;
+    *)
+      failure 'unsupported canonical GitHub origin'
+      ;;
+  esac
+  path=${path%/}
+  path=${path%.git}
+  [[ "$path" =~ ^([A-Za-z0-9][A-Za-z0-9-]*)/([A-Za-z0-9_.-]+)$ ]] \
+    || failure 'canonical GitHub origin has an unsupported repository path'
+  owner=${BASH_REMATCH[1]}
+  name=${BASH_REMATCH[2]}
+  [[ "$name" != . && "$name" != .. ]] \
+    || failure 'canonical GitHub origin has an unsupported repository path'
+  GH_REPOSITORY="github.com/$owner/$name"
+}
+
 fetch_master() {
   git fetch --quiet --no-write-fetch-head origin "refs/heads/master:$REF_ROOT/master" 2>/dev/null \
     || failure 'cannot fetch canonical origin/master'
@@ -87,7 +131,7 @@ read_pr() {
   local rows number head managed cross extra count=0
   PR_NUMBER=""
   PR_HEAD=""
-  rows=$(gh pr list --state open --base master --head "$BRANCH" \
+  rows=$(gh pr list --repo "$GH_REPOSITORY" --state open --base master --head "$BRANCH" \
     --json number,headRefOid,body,isCrossRepository \
     --jq '.[] | [.number, .headRefOid, (.body | contains("<!-- snapper-polygon-gitlink:v1 -->")), .isCrossRepository] | @tsv' \
     </dev/null 2>/dev/null) || failure 'cannot inspect the automation pull request'
@@ -173,7 +217,7 @@ queue_pr() {
     printf '%s\n\n%s\n%s\n' "$PR_MARKER" \
       'Update only data/polygon to its published origin/master snapshot.' \
       "Selected Polygon commit: $SUB" >"$RUN_DIR/pr-body"
-    gh pr create --base master --head "$BRANCH" --title 'Update the Polygon data snapshot' \
+    gh pr create --repo "$GH_REPOSITORY" --base master --head "$BRANCH" --title 'Update the Polygon data snapshot' \
       --body-file "$RUN_DIR/pr-body" </dev/null >/dev/null 2>&1 \
       || failure 'cannot create the automation pull request'
     read_pr
@@ -181,9 +225,9 @@ queue_pr() {
   fi
   # GitHub may reject enabling auto-merge once the PR is already clean. A
   # normal merge with the identical head fence still enforces every rule.
-  if ! gh pr merge "$PR_NUMBER" --auto --merge --match-head-commit "$NEW_HEAD" \
+  if ! gh pr merge "$PR_NUMBER" --repo "$GH_REPOSITORY" --auto --merge --match-head-commit "$NEW_HEAD" \
     </dev/null >/dev/null 2>&1; then
-    gh pr merge "$PR_NUMBER" --merge --match-head-commit "$NEW_HEAD" \
+    gh pr merge "$PR_NUMBER" --repo "$GH_REPOSITORY" --merge --match-head-commit "$NEW_HEAD" \
       </dev/null >/dev/null 2>&1 || failure 'cannot request a policy-compliant merge at the expected head'
   fi
 }
@@ -229,6 +273,7 @@ mirror_approved_master() {
   [[ "$failed" = 0 ]] || failure 'approved-master mirror synchronization failed'
 }
 
+resolve_github_repository
 SUB=$(git -C "$CHILD" rev-parse HEAD 2>/dev/null) || failure 'cannot resolve selected Polygon HEAD'
 git -C "$CHILD" fetch --quiet --no-write-fetch-head origin "refs/heads/master:$REF_ROOT/child" 2>/dev/null \
   || failure 'cannot verify the published Polygon snapshot'
@@ -241,7 +286,7 @@ validate_automation
 RECORDED=$(git rev-parse "$BASE:data/polygon") || failure 'cannot inspect the canonical Polygon pin'
 if [[ "$RECORDED" = "$SUB" ]]; then
   if [[ -n "$PR_NUMBER" ]]; then
-    gh pr close "$PR_NUMBER" </dev/null >/dev/null 2>&1 || failure 'cannot close a stale managed pull request'
+    gh pr close "$PR_NUMBER" --repo "$GH_REPOSITORY" </dev/null >/dev/null 2>&1 || failure 'cannot close a stale managed pull request'
     printf 'gitlink: CLOSED stale PR #%s; canonical master already has the selected snapshot\n' "$PR_NUMBER"
   fi
   rm -f -- "$PENDING"
