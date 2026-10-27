@@ -26,6 +26,7 @@ set +x
 ROOT=${SNAPPER_ARCHIVE_ROOT:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)}
 REPO=${SNAPPER_APP_ROOT:?set SNAPPER_APP_ROOT to the Snapper application checkout}
 GITLINK_REMOTES=${SNAPPER_GITLINK_REMOTES:?set SNAPPER_GITLINK_REMOTES to the space-separated gitlink remote names}
+PUBLISHER="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)/polygon-publish-gitlink.sh"
 
 # Aggregates are ONE API call per symbol with the window as a parameter, so the
 # 12s-per-symbol throttle dominates and a wider window is free. Confirmed
@@ -254,75 +255,15 @@ else
   echo "WARN: cannot cd $REPO/data/polygon; CSV cache left uncommitted"
 fi
 
-# --- PHASE 4 bump the superproject gitlink (daily) ---
-# Built with PLUMBING against a freshly fetched origin/master: a temporary index
-# is read from that commit, only the data/polygon gitlink is replaced, and the
-# result is committed with commit-tree and pushed directly. HEAD, the index and
-# the shared working tree are never touched.
-#
-# The checkout-based version this replaces failed 3 days out of 4 with
-# "origin non-ff". Its retry loop assumed the failure was a race, so it slept and
-# retried; the real cause is persistent — an interactive session pushes to master
-# through the day, so the local branch lags origin and no number of retries can
-# push a commit built on a stale base. Rebasing in cron was not an option either:
-# that working tree is shared, and rebasing under someone's uncommitted work is
-# the exact collision this script must never cause.
-echo "-- PHASE 4 bump superproject gitlink $(date -u +%T)"
-FAILS="$ROOT/.polygon-gitlink-fails"
-if cd "$REPO"; then
-  SUB=$(git -C data/polygon rev-parse HEAD 2>/dev/null)
-  if [ -z "$SUB" ]; then
-    echo "gitlink: FAILED cannot read data/polygon HEAD"
-    echo $(( $(cat "$FAILS" 2>/dev/null || echo 0) + 1 )) >"$FAILS"
-  elif ! git fetch -q origin master 2>/dev/null; then
-    echo "gitlink: FAILED cannot fetch origin"
-    echo $(( $(cat "$FAILS" 2>/dev/null || echo 0) + 1 )) >"$FAILS"
-  else
-    BASE=$(git rev-parse FETCH_HEAD)
-    RECORDED=$(git rev-parse "$BASE:data/polygon" 2>/dev/null)
-    if [ "$RECORDED" = "$SUB" ]; then
-      echo "gitlink: already current on origin ($(echo $SUB | cut -c1-12))"
-      rm -f "$FAILS"
-    else
-      TMPIDX=$(mktemp "$ROOT/.polygon-index.XXXXXX")
-      NEW=""
-      if GIT_INDEX_FILE="$TMPIDX" git read-tree "$BASE" 2>/dev/null \
-         && GIT_INDEX_FILE="$TMPIDX" git update-index --cacheinfo 160000,"$SUB",data/polygon 2>/dev/null; then
-        TREE=$(GIT_INDEX_FILE="$TMPIDX" git write-tree 2>/dev/null)
-        [ -n "$TREE" ] && NEW=$(git commit-tree "$TREE" -p "$BASE" \
-          -m "polygon: $(date -u +%F) daily gitlink" 2>/dev/null)
-      fi
-      rm -f "$TMPIDX"
-      if [ -z "$NEW" ]; then
-        echo "gitlink: FAILED could not build the bump commit"
-        echo $(( $(cat "$FAILS" 2>/dev/null || echo 0) + 1 )) >"$FAILS"
-      else
-        pushed=""
-        failed=""
-        for R in $GITLINK_REMOTES; do
-          if git push -q "$R" "$NEW:master" 2>/dev/null; then
-            pushed="$pushed $R"
-          else
-            failed="$failed $R"
-          fi
-        done
-        if [ -n "$pushed" ] && [ -z "$failed" ]; then
-          echo "gitlink: bumped to $(echo $SUB | cut -c1-12), pushed$pushed"
-          rm -f "$FAILS"
-        elif [ -n "$pushed" ]; then
-          echo "gitlink: bumped, pushed$pushed but FAILED$failed"
-          echo $(( $(cat "$FAILS" 2>/dev/null || echo 0) + 1 )) >"$FAILS"
-        else
-          echo "gitlink: FAILED push to every remote (base moved again?)"
-          echo $(( $(cat "$FAILS" 2>/dev/null || echo 0) + 1 )) >"$FAILS"
-        fi
-      fi
-    fi
-  fi
-  N=$(cat "$FAILS" 2>/dev/null || echo 0)
-  [ "$N" -ge 2 ] && echo "gitlink: !! $N CONSECUTIVE FAILURES — the superproject pointer is stale"
+# --- PHASE 4 request a reviewed superproject gitlink update ---
+# The publisher owns its own lock, isolated Git index, managed PR and failure
+# counter. A queued PR is explicitly pending; mirrors receive only approved
+# origin/master. Its first failure must reach the daily job's existing alert.
+echo "-- PHASE 4 publish superproject gitlink $(date -u +%T)"
+if "$PUBLISHER"; then
+  :
 else
-  echo "WARN: cannot cd $REPO; gitlink not bumped"
+  echo "gitlink: FAILED protected-master publication or approved-master mirroring"
 fi
 
 echo "=== polygon-daily done $(date -u +%FT%TZ) ==="

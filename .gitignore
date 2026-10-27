@@ -29,3 +29,9 @@
 # It is how a run detects that the previous ones only ever skipped on a held
 # lock, which otherwise looks identical to a healthy quiet day.
 /.partitions.last-success
+# Polygon publication state and isolated per-run Git indexes.
+/.polygon-gitlink-fails
+/.polygon-gitlink-pending
+/.polygon-gitlink.lock
+/.polygon-gitlink.*/
+__pycache__/
