@@ -88,3 +88,81 @@ valid only because tick `id` is monotonic with arrival. Trades are sliced by
 executed in May can arrive in June and carry a high id. The trades exporter
 therefore uses an indexed range predicate, never a binary search. Copying the
 ticks approach onto trades would silently file late arrivals under the wrong day.
+
+## Polygon publication respects the protected application branch
+
+`polygon-daily.sh` preserves its existing fetch, load, synthesis and monthly
+Polygon snapshot phases. Its final phase calls `polygon-publish-gitlink.sh` to
+publish the application's `data/polygon` pointer through a pull request.
+
+The standalone publisher uses the existing `SNAPPER_APP_ROOT`,
+`SNAPPER_ARCHIVE_ROOT` and `SNAPPER_GITLINK_REMOTES` configuration. It introduces
+no new required environment settings. The cron user must have GitHub CLI (`gh`)
+in its normal path and an authenticated account that may create branches and
+pull requests in the application's canonical `origin` repository. GitHub
+repository auto-merge must be enabled. Branch protection, required checks and
+reviews continue to apply; the script neither approves its own PR nor uses an
+administrator bypass.
+
+Every GitHub PR operation is explicitly bound with `--repo` to the canonical
+`github.com/owner/repository` identity parsed from the raw Git
+`remote.origin.url`. Git's transport rewrites do not change that logical identity.
+The helper ignores `gh repo set-default`, `GH_REPO` and `GH_HOST`. It supports
+GitHub.com SCP-style SSH URLs, `ssh://git@github.com/` URLs and HTTPS URLs.
+HTTPS user information, query strings and fragments are discarded in shell
+memory; raw origin URLs are never passed to GitHub CLI or printed. Unsupported
+hosts, paths and multiple origin URLs fail before publication instead of
+selecting another repository. No additional configuration variable can redirect
+this repository binding.
+
+Publication follows these rules:
+
+- The selected Polygon checkout must be initialized and its `HEAD` must exactly
+  match the data repository's fetched `origin/master`. A local-only commit or a
+  stale checkout is refused. Monthly snapshot amendment makes raw commit equality
+  more useful here than an ancestry assumption.
+- A temporary Git index starts from freshly fetched application `origin/master`
+  and changes only `data/polygon`. The shared checkout's `HEAD`, index, staged
+  files and untracked work are not changed. Per-run fetch refs are isolated and
+  removed afterwards; another process's `FETCH_HEAD` is not used or overwritten.
+- The stable `automation/polygon-gitlink` branch has a managed provenance marker.
+  Pending updates append commits whose parents retain both the latest canonical
+  master and previous automation head when necessary. Pushes are ordinary fast
+  forwards. Unknown history, non-gitlink changes and concurrent branch advances
+  fail safely instead of being overwritten.
+- One managed PR is reused. Auto-merge is requested with `--merge` and an exact
+  expected head commit. If enabling auto-merge is rejected, it tries an ordinary
+  merge with the identical expected head; GitHub still enforces its rules.
+  A `PENDING` log means GitHub requirements still need to
+  complete; it does not mean the pointer is published. The pending-state stamp
+  retains the PR's first observed queue time across updates and logs a reminder
+  after a day. Inspect a persistently pending PR's checks and reviews. `MERGED` means a subsequent canonical fetch
+  contains the selected pointer; `CURRENT` means it already did. A stale managed
+  PR is closed when canonical master already contains that snapshot so it cannot
+  later restore an older pointer.
+- Other configured remotes receive only the fetched, approved `origin/master`,
+  never the pending PR branch. Mirror pushes are ordinary fast forwards. A
+  divergent mirror is reported as a failure and requires a separately reviewed
+  repair; the publisher never force-resets it or imports its history.
+
+A separate `.polygon-gitlink.lock` covers publication, PR handling and mirrors.
+An already-running publisher is a normal lock skip. The first real publication
+or mirror error increments `.polygon-gitlink-fails` and returns nonzero. The daily
+wrapper records that failure for its existing alert path on the first failed
+run. Successful current, merged or accepted-pending publication clears the
+failure counter only after approved-master mirror synchronization succeeds.
+Locks, counters and isolated index workspaces are runtime state and are ignored
+by Git.
+
+## Offline checks
+
+Run the archive repository's own gate with:
+
+```bash
+make check-all
+```
+
+It checks every shell script's syntax and runs standard-library Python regression
+tests against temporary local Git repositories and a mock GitHub CLI. No market
+API, database, production checkout, notification channel or real GitHub operation
+is used. The same gate runs in this repository's GitHub Actions workflow.
