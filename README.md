@@ -75,6 +75,17 @@ nothing. Failures are mailed explicitly via `SNAPPER_ALERT_EMAIL`, and a run
 that only ever skips on a held lock is caught by a last-success stamp — a skip
 exits zero by design and is otherwise indistinguishable from a quiet healthy day.
 
+**Planner statistics are swept after renewal, because a crash erases them.**
+Crash recovery discards PostgreSQL's cumulative statistics. A closed daily leaf
+never changes again, so autoanalyze never revisits it, and autovacuum never
+analyzes partitioned parents. After one unclean restart nearly every closed
+candle leaf had no statistics, and 15 ms reads took up to 39 s. Each run
+therefore ends with `snapper daily-partitions analyze --stale --apply` (capped
+by `ANALYZE_STALE_LIMIT`, default 200). It analyzes only relations whose
+analyze timestamps are both NULL, one per short `SKIP_LOCKED` transaction, and
+never recurses into a parent. A failed sweep is mailed but does not withhold the
+renewal success stamp.
+
 **DDL goes through the application CLI, never hand-written SQL.** A bare
 `CREATE TABLE ... PARTITION OF` inherits the parent's indexes but silently omits
 the leaf-local primary key and the active-`public_id` unique index. Two leaves

@@ -75,6 +75,10 @@ ENSURE_RETRY_SLEEP=${ENSURE_RETRY_SLEEP:-20}
 # lock: a skipped run exits 0 by design, so consecutive skips are otherwise
 # indistinguishable from healthy quiet.
 STALE_SUCCESS_DAYS=${STALE_SUCCESS_DAYS:-2}
+# Relations one planner-statistics sweep may ANALYZE. Steady state finds almost
+# nothing, since future leaves are excluded and live leaves autoanalyze. The cap
+# matters after a crash, which can leave every closed leaf without statistics.
+ANALYZE_STALE_LIMIT=${ANALYZE_STALE_LIMIT:-200}
 
 LOG="$ROOT/logs/partitions-$(date -u +%Y-%m).log"
 STAMP="$ROOT/.partitions.last-success"
@@ -387,11 +391,50 @@ for TABLE in ticks trades candles; do
   fi
 done
 
+# Planner statistics, swept once per run after renewal.
+#
+# WHY: crash recovery throws away PostgreSQL's cumulative statistics, including
+# last_analyze, last_autoanalyze and n_mod_since_analyze. A closed daily leaf
+# never changes again, so autoanalyze never revisits it, and autovacuum never
+# analyzes partitioned parents at all. After one unclean restart nearly every
+# closed candle leaf had no planner statistics. Reads that normally take 15 ms
+# then took up to 39 s, and the P&L snapshotter hit statement timeouts.
+#
+# The CLI picks relations whose last_analyze and last_autoanalyze are both
+# NULL, excluding future leaves. It runs ANALYZE (SKIP_LOCKED) on one relation
+# per short transaction with a 2s lock timeout, and uses ONLY for parents so a
+# parent never recurses into its partitions. A relation that is busy or slow is
+# reported as skipped and does not fail the run. A healthy night costs one CLI
+# bootstrap and almost no ANALYZE work.
+#
+# `ensure --apply` already analyzes its anchor's previous day and the parent
+# after it creates leaves. Here that anchor is the first missing day, normally
+# at the forward edge, so that leaf is a future, empty one. The sweep is what
+# actually repairs statistics lost in a crash.
+#
+# Failure is reported but does not block. Renewal health is still stamped, so
+# a broken sweep cannot be mistaken for the stuck-lock case.
+echo "== analyze-stale $(date -u +%T)"
+ANALYZE_RC=0
+.venv/bin/snapper daily-partitions analyze --stale --apply \
+  --limit "$ANALYZE_STALE_LIMIT" || ANALYZE_RC=$?
+if (( ANALYZE_RC == 0 )); then
+  SUMMARY+=("analyze-stale ok")
+else
+  echo "-- analyze-stale FAILED rc=${ANALYZE_RC}"
+  SUMMARY+=("analyze-stale FAILED rc=${ANALYZE_RC}")
+fi
+
 echo "=== partitions-daily done $(date -u +%FT%TZ) ==="
 printf '%s\n' "${SUMMARY[@]}"
 
 if (( ${#FAILED[@]} == 0 && ${#BLOCKED[@]} == 0 )); then
   date -u +%s >"$STAMP"
+  if (( ANALYZE_RC != 0 )); then
+    echo "Snapper partitions OK, ANALYZE sweep FAILED rc=${ANALYZE_RC}"
+    notify "Snapper partitions ANALYZE-FAILED rc=${ANALYZE_RC}"
+    exit 1
+  fi
   echo "OK all tables"
   exit 0
 fi
@@ -405,6 +448,9 @@ if (( ${#BLOCKED[@]} > 0 )); then
 fi
 if (( ${#FAILED[@]} > 0 )); then
   STATUS="$STATUS FAILED[${FAILED[*]}]"
+fi
+if (( ANALYZE_RC != 0 )); then
+  STATUS="$STATUS ANALYZE-FAILED"
 fi
 echo "$STATUS"
 notify "$STATUS"
