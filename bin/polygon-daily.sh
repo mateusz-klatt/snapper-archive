@@ -62,7 +62,7 @@ exec >>"$LOG" 2>&1
 # helper is fatal on purpose: this job's failures would otherwise go nowhere,
 # and cron's MAILTO still catches an abort at this point.
 . "$(dirname -- "${BASH_SOURCE[0]}")/_alert.sh"
-snapper_alert_on_failure "polygon-daily" "$LOG"
+snapper_alert_on_failure "polygon-daily" "$LOG" '^=== polygon-daily [0-9]'
 
 STARTED=$(date -u +%s)
 
@@ -182,8 +182,12 @@ else
     PART_ANCHOR=$(date -u -d "$PART_ANCHOR + 14 days" +%F)
   done
   echo "-- PHASE 2 load since ${SINCE} $(date -u +%T)"
-  .venv/bin/snapper polygon-load-csv --all -t minute --since "$SINCE"
-  echo "load rc=$? elapsed_total=$(( ($(date -u +%s) - STARTED) / 60 ))min"
+  LOAD_RC=0
+  .venv/bin/snapper polygon-load-csv --all -t minute --since "$SINCE" || LOAD_RC=$?
+  echo "load rc=$LOAD_RC elapsed_total=$(( ($(date -u +%s) - STARTED) / 60 ))min"
+  if (( LOAD_RC != 0 )); then
+    echo "WARN: polygon-load-csv failed (rc=$LOAD_RC)"
+  fi
 fi
 
 # --- PHASE 2b synthesize higher timeframes ---
