@@ -43,9 +43,14 @@ export DB_URL="${RAW//$DB_HOST_FROM/$DB_HOST_TO}"
 
 for TF in 1m 5m 15m 30m 1h 4h 1d; do
   echo "== $TF $(date -u +%T)"
-  .venv/bin/snapper archive --table candles-audit --closed-only --timeframe "$TF" \
-    --from "$FROM" --to "$TO" --output-dir "$ROOT" --purge
-  echo "rc=$?"
+  if .venv/bin/snapper archive --table candles-audit --closed-only --timeframe "$TF" \
+    --from "$FROM" --to "$TO" --output-dir "$ROOT" --purge; then
+    echo "OK: timeframe=$TF rc=0 range=$FROM..$TO"
+  else
+    rc=$?
+    echo "ABORT: timeframe=$TF rc=$rc range=$FROM..$TO"
+    exit "$rc"
+  fi
 done
 
 echo "=== candles sweep done $(date -u +%FT%TZ) ==="
